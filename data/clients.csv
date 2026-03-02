@@ -1,0 +1,5 @@
+phone;meterNumber;subscriberNumber;police;name;address;tariffCode;category;grouping;center;zone
+96648383;MT-00012345;ABN-00004567;PL-2020-001;Admin Test;"Niamey, Plateau";T1;01;GRP-01;Niamey Centre;Zone-1
+96211223;MT-00067890;ABN-00007890;PL-2019-014;Issa Abdou;"Niamey, Yantala";T2;01;GRP-01;Niamey Centre;Zone-2
+90887766;MT-00123456;ABN-00001234;PL-2021-205;Amina Oumarou;"Dosso, Centre-ville";T1;02;GRP-02;Dosso;Dosso-1
+95550011;MT-00999999;ABN-00009999;PL-2018-090;Entreprise Exemple;"Maradi, Zone Industrielle";T3;03;GRP-03;Maradi;Maradi-IND

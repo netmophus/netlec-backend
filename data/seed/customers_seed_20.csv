@@ -1,0 +1,21 @@
+phone,meterNumber,subscriberNumber,police,name,address,tariffCode,category,grouping,center,zone,sector,oldIndex
+90000001,MT-NIA-0001,ABN-NIA-0001,PL-NIA-0001,Client Niamey 01,"Niamey, Quartier 01",T2,01,GRP-NIA,Niamey Centre,Zone-1,S1,12010
+90000002,MT-NIA-0002,ABN-NIA-0002,PL-NIA-0002,Client Niamey 02,"Niamey, Quartier 02",T2,01,GRP-NIA,Niamey Centre,Zone-1,S1,12020
+90000003,MT-NIA-0003,ABN-NIA-0003,PL-NIA-0003,Client Niamey 03,"Niamey, Quartier 03",T2,01,GRP-NIA,Niamey Centre,Zone-1,S1,12030
+90000004,MT-NIA-0004,ABN-NIA-0004,PL-NIA-0004,Client Niamey 04,"Niamey, Quartier 04",T2,01,GRP-NIA,Niamey Centre,Zone-1,S1,12040
+90000005,MT-NIA-0005,ABN-NIA-0005,PL-NIA-0005,Client Niamey 05,"Niamey, Quartier 05",T2,01,GRP-NIA,Niamey Centre,Zone-1,S1,12050
+90000006,MT-NIA-0006,ABN-NIA-0006,PL-NIA-0006,Client Niamey 06,"Niamey, Quartier 06",T2,01,GRP-NIA,Niamey Centre,Zone-1,S1,12060
+90000007,MT-NIA-0007,ABN-NIA-0007,PL-NIA-0007,Client Niamey 07,"Niamey, Quartier 07",T2,01,GRP-NIA,Niamey Centre,Zone-1,S1,12070
+90000008,MT-NIA-0008,ABN-NIA-0008,PL-NIA-0008,Client Niamey 08,"Niamey, Quartier 08",T2,01,GRP-NIA,Niamey Centre,Zone-1,S1,12080
+90000009,MT-NIA-0009,ABN-NIA-0009,PL-NIA-0009,Client Niamey 09,"Niamey, Quartier 09",T2,01,GRP-NIA,Niamey Centre,Zone-1,S1,12090
+90000010,MT-NIA-0010,ABN-NIA-0010,PL-NIA-0010,Client Niamey 10,"Niamey, Quartier 10",T2,01,GRP-NIA,Niamey Centre,Zone-1,S1,12100
+91000001,MT-DOS-0001,ABN-DOS-0001,PL-DOS-0001,Client Dosso 01,"Dosso, Quartier 01",T1,02,GRP-DOS,Dosso,Dosso-1,S1,8010
+91000002,MT-DOS-0002,ABN-DOS-0002,PL-DOS-0002,Client Dosso 02,"Dosso, Quartier 02",T1,02,GRP-DOS,Dosso,Dosso-1,S1,8020
+91000003,MT-DOS-0003,ABN-DOS-0003,PL-DOS-0003,Client Dosso 03,"Dosso, Quartier 03",T1,02,GRP-DOS,Dosso,Dosso-1,S1,8030
+91000004,MT-DOS-0004,ABN-DOS-0004,PL-DOS-0004,Client Dosso 04,"Dosso, Quartier 04",T1,02,GRP-DOS,Dosso,Dosso-1,S1,8040
+91000005,MT-DOS-0005,ABN-DOS-0005,PL-DOS-0005,Client Dosso 05,"Dosso, Quartier 05",T1,02,GRP-DOS,Dosso,Dosso-1,S1,8050
+92000001,MT-MAR-0001,ABN-MAR-0001,PL-MAR-0001,Client Maradi 01,"Maradi, Quartier 01",T3,03,GRP-MAR,Maradi,Maradi-IND,S1,15010
+92000002,MT-MAR-0002,ABN-MAR-0002,PL-MAR-0002,Client Maradi 02,"Maradi, Quartier 02",T3,03,GRP-MAR,Maradi,Maradi-IND,S1,15020
+92000003,MT-MAR-0003,ABN-MAR-0003,PL-MAR-0003,Client Maradi 03,"Maradi, Quartier 03",T3,03,GRP-MAR,Maradi,Maradi-IND,S1,15030
+92000004,MT-MAR-0004,ABN-MAR-0004,PL-MAR-0004,Client Maradi 04,"Maradi, Quartier 04",T3,03,GRP-MAR,Maradi,Maradi-IND,S1,15040
+92000005,MT-MAR-0005,ABN-MAR-0005,PL-MAR-0005,Client Maradi 05,"Maradi, Quartier 05",T3,03,GRP-MAR,Maradi,Maradi-IND,S1,15050
