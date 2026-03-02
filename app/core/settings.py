@@ -1,0 +1,39 @@
+from typing import Any
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    APP_NAME: str = "nigelec-backend"
+    ENV: str = "dev"
+
+    MONGO_URI: str
+    MONGO_DB: str
+
+    JWT_SECRET: str
+    JWT_EXPIRES_MIN: int = 1440
+
+    CORS_ORIGINS: list[str] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+    ]
+    CORS_ORIGIN_REGEX: str | None = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+
+    ADMIN_PHONE: str = "90000000"
+    ADMIN_PASSWORD: str = "Admin@123"
+    ADMIN_NAME: str = "Admin"
+
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return [origin.strip() for origin in value.split(",") if origin.strip()]
+        return value
+
+
+settings = Settings()
