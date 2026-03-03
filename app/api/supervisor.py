@@ -8,7 +8,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from pymongo.errors import DuplicateKeyError
 from starlette.responses import StreamingResponse
 
-from app.api.models import CreateAgentBySupervisorRequest, GenerateToursRequest, GenerateToursResponse, MeterPublic, ReadingWithLocationPublic, TourItem, TourPublic, UserPublic
+from app.api.models import CreateAgentBySupervisorRequest, GenerateToursRequest, GenerateToursResponse, MeterPublic, ReadingWithLocationPublic, TourItem, TourPublic, UserPublic, ZoneRef
 from app.core.deps import get_current_user_payload, get_database, require_roles
 from app.core.security import hash_password
 
@@ -78,6 +78,44 @@ def _zones_or_query(assigned_zones: list[dict], include_sector_none: bool) -> li
         else:
             zones_or.append({"center": center, "zone": zone})
     return zones_or
+
+
+def _normalize_zone_refs(items: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for z in items:
+        center = str(z.get("center") or "").strip()
+        zone = str(z.get("zone") or "").strip()
+        sector = str(z.get("sector") or "").strip()
+        if not center or not zone or not sector:
+            continue
+        key = (center, zone, sector)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"center": center, "zone": zone, "sector": sector})
+    out.sort(key=lambda x: (x["center"], x["zone"], x["sector"]))
+    return out
+
+
+@router.get(
+    "/zones",
+    response_model=list[ZoneRef],
+    dependencies=[Depends(require_roles("supervisor"))],
+)
+async def list_supervisor_zones(
+    token_payload: dict = Depends(get_current_user_payload),
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    await _get_supervisor_context(token_payload, db)
+
+    zone_docs = await db.zones.find(
+        {},
+        {"center": 1, "zone": 1, "sector": 1},
+    ).to_list(length=2000)
+
+    normalized = _normalize_zone_refs(zone_docs)
+    return normalized
 
 
 @router.get(
