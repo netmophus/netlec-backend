@@ -31,12 +31,18 @@ async def _load_tariff_tiers_db(db: AsyncIOMotorDatabase) -> list[dict]:
         rk = d.get("ratePerKwh")
         fk = d.get("fromKwh")
         tk = d.get("toKwh")
+        raw_code = d.get("code")
         if not isinstance(rk, int) or not isinstance(fk, int):
             continue
         to_kwh: int | None = None
         if isinstance(tk, int):
             to_kwh = int(tk)
-        tiers.append({"fromKwh": int(fk), "toKwh": to_kwh, "ratePerKwh": int(rk)})
+        code: str | None = None
+        if isinstance(raw_code, str):
+            normalized = raw_code.strip().upper()
+            if normalized:
+                code = normalized
+        tiers.append({"fromKwh": int(fk), "toKwh": to_kwh, "ratePerKwh": int(rk), "code": code})
     tiers.sort(key=lambda x: int(x.get("fromKwh") or 0))
     return tiers
 
@@ -79,6 +85,41 @@ def _compute_progressive_amount(consumption: int, tiers: list[dict]) -> int | No
         if end is None:
             break
     return int(amount)
+
+
+def _infer_tariff_code_from_consumption(consumption: int, tiers: list[dict]) -> str | None:
+    if not isinstance(consumption, int) or consumption < 0:
+        return None
+
+    for t in tiers:
+        try:
+            start = int(t.get("fromKwh"))
+        except Exception:
+            continue
+
+        end_raw = t.get("toKwh")
+        end: int | None
+        if end_raw is None:
+            end = None
+        else:
+            try:
+                end = int(end_raw)
+            except Exception:
+                end = None
+
+        if consumption < start:
+            continue
+        if end is not None and consumption > end:
+            continue
+
+        code = t.get("code")
+        if isinstance(code, str):
+            normalized = code.strip().upper()
+            if normalized:
+                return normalized
+        return None
+
+    return None
 
 
 async def _tariff_rate_per_kwh_db(db: AsyncIOMotorDatabase, tariff_code: str | None) -> int | None:
@@ -209,6 +250,19 @@ async def create_reading(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Nouvel index inférieur à l'ancien index.")
         consumption = payload.newIndex - old_index
 
+    tariff_code: str | None = None
+    raw_customer_tariff = customer.get("tariffCode")
+    if isinstance(raw_customer_tariff, str):
+        normalized_customer_tariff = raw_customer_tariff.strip().upper()
+        if normalized_customer_tariff:
+            tariff_code = normalized_customer_tariff
+
+    tiers: list[dict] = []
+    if isinstance(consumption, int):
+        tiers = await _load_tariff_tiers_db(db)
+        if not tariff_code:
+            tariff_code = _infer_tariff_code_from_consumption(int(consumption), tiers)
+
     now = datetime.now(timezone.utc)
     doc = {
         "date": payload.date,
@@ -218,7 +272,7 @@ async def create_reading(
         "oldIndex": old_index,
         "newIndex": payload.newIndex,
         "consumption": consumption,
-        "tariffCode": customer.get("tariffCode"),
+        "tariffCode": tariff_code,
         "gps": payload.gps,
         "gpsMissing": payload.gpsMissing,
         "gpsMissingReason": payload.gpsMissingReason,
@@ -245,9 +299,12 @@ async def create_reading(
 
     amount: int | None = None
     cons = created.get("consumption")
-    tc = created.get("tariffCode") or customer.get("tariffCode")
+    tc = created.get("tariffCode") if isinstance(created.get("tariffCode"), str) else tariff_code
     if isinstance(cons, int):
-        tiers = await _load_tariff_tiers_db(db)
+        if not tiers:
+            tiers = await _load_tariff_tiers_db(db)
+        if not tc:
+            tc = _infer_tariff_code_from_consumption(int(cons), tiers)
         amount = _compute_progressive_amount(int(cons), tiers)
         if amount is None:
             rate = await _tariff_rate_per_kwh_db(db, tc)
@@ -381,12 +438,27 @@ async def update_agent_reading(
     if isinstance(old_index, int):
         consumption = int(payload.newIndex - old_index)
 
+    tariff_code: str | None = None
+    raw_tariff = reading.get("tariffCode") or customer.get("tariffCode")
+    if isinstance(raw_tariff, str):
+        normalized_tariff = raw_tariff.strip().upper()
+        if normalized_tariff:
+            tariff_code = normalized_tariff
+
+    tiers: list[dict] = []
+    if isinstance(consumption, int):
+        tiers = await _load_tariff_tiers_db(db)
+        if not tariff_code:
+            tariff_code = _infer_tariff_code_from_consumption(int(consumption), tiers)
+
     now = datetime.now(timezone.utc)
     update_doc: dict = {
         "newIndex": payload.newIndex,
         "consumption": consumption,
         "updatedAt": now,
     }
+    if tariff_code is not None:
+        update_doc["tariffCode"] = tariff_code
     if payload.gps is not None:
         update_doc["gps"] = payload.gps
     if payload.gpsMissing is not None:
@@ -412,10 +484,13 @@ async def update_agent_reading(
 
     invoice_id = f"INV-{str(roid)}"
     amount: int | None = None
-    tc = updated.get("tariffCode") or customer.get("tariffCode")
+    tc = updated.get("tariffCode") if isinstance(updated.get("tariffCode"), str) else tariff_code
     cons = updated.get("consumption")
     if isinstance(cons, int):
-        tiers = await _load_tariff_tiers_db(db)
+        if not tiers:
+            tiers = await _load_tariff_tiers_db(db)
+        if not tc:
+            tc = _infer_tariff_code_from_consumption(int(cons), tiers)
         amount = _compute_progressive_amount(int(cons), tiers)
         if amount is None:
             rate = await _tariff_rate_per_kwh_db(db, tc)
