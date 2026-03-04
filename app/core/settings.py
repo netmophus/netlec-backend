@@ -30,7 +30,7 @@ class Settings(BaseSettings):
 
     OCR_PROVIDER: str = "ocr_space"
     OCR_SPACE_API_KEY: str | None = None
-    OCR_SPACE_ENDPOINT: str = "https://api.ocr.space/parse/imageurl"
+    OCR_SPACE_ENDPOINT: str = "https://api.ocr.space/parse/image"
     GOOGLE_VISION_API_KEY: str | None = None
 
     @field_validator("CORS_ORIGINS", mode="before")
