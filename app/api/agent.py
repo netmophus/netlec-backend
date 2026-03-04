@@ -152,24 +152,34 @@ def _end_of_month_due_date(reading_date_iso: str, grace_days: int) -> date | Non
     return date(rd_d.year, rd_d.month, last_day) + timedelta(days=int(grace_days))
 
 
-def _extract_index_from_text(raw_text: str | None) -> str | None:
+def _extract_index_from_text(raw_text: str | None, old_index: int | None = None) -> str | None:
     if not raw_text:
         return None
 
-    candidates: list[tuple[str, int]] = []
+    candidates: list[tuple[str, int, int]] = []
     for match in re.finditer(r"\d{4,9}", raw_text):
         token = match.group(0)
         if token:
-            candidates.append((token, match.start()))
+            try:
+                numeric_value = int(token)
+            except Exception:
+                continue
+            candidates.append((token, match.start(), numeric_value))
 
     if not candidates:
         return None
 
-    best_token, _ = max(candidates, key=lambda item: (len(item[0]), item[1]))
+    if isinstance(old_index, int) and old_index >= 0:
+        viable = [item for item in candidates if item[2] >= old_index]
+        if viable:
+            best_token, _, _ = min(viable, key=lambda item: (item[2] - old_index, abs(len(item[0]) - 6), item[1]))
+            return best_token
+
+    best_token, _, _ = max(candidates, key=lambda item: (int(4 <= len(item[0]) <= 7), -abs(len(item[0]) - 6), item[1]))
     return best_token
 
 
-async def _ocr_with_ocr_space(image_url: str) -> ReadingOcrResponse:
+async def _ocr_with_ocr_space(image_url: str, old_index: int | None = None) -> ReadingOcrResponse:
     api_key = settings.OCR_SPACE_API_KEY
     if not api_key:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="OCR_SPACE_API_KEY manquant.")
@@ -212,7 +222,7 @@ async def _ocr_with_ocr_space(image_url: str) -> ReadingOcrResponse:
                 raw_text_parts.append(parsed_text.strip())
 
     raw_text = "\n".join(raw_text_parts).strip() if raw_text_parts else None
-    proposed_index = _extract_index_from_text(raw_text)
+    proposed_index = _extract_index_from_text(raw_text, old_index=old_index)
 
     return ReadingOcrResponse(
         provider="ocr_space",
@@ -222,7 +232,7 @@ async def _ocr_with_ocr_space(image_url: str) -> ReadingOcrResponse:
     )
 
 
-async def _ocr_with_google_vision(image_url: str) -> ReadingOcrResponse:
+async def _ocr_with_google_vision(image_url: str, old_index: int | None = None) -> ReadingOcrResponse:
     api_key = settings.GOOGLE_VISION_API_KEY
     if not api_key:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="GOOGLE_VISION_API_KEY manquant.")
@@ -273,7 +283,7 @@ async def _ocr_with_google_vision(image_url: str) -> ReadingOcrResponse:
                 if isinstance(candidate, str) and candidate.strip():
                     raw_text = candidate.strip()
 
-    proposed_index = _extract_index_from_text(raw_text)
+    proposed_index = _extract_index_from_text(raw_text, old_index=old_index)
     return ReadingOcrResponse(
         provider="google_vision",
         rawText=raw_text,
@@ -307,9 +317,9 @@ async def ocr_agent_reading(
 
     provider = settings.OCR_PROVIDER.strip().lower()
     if provider in {"ocr_space", "ocr.space", "ocrspace"}:
-        return await _ocr_with_ocr_space(payload.imageUrl)
+        return await _ocr_with_ocr_space(payload.imageUrl, old_index=payload.oldIndex)
     if provider in {"google", "google_vision", "google-vision"}:
-        return await _ocr_with_google_vision(payload.imageUrl)
+        return await _ocr_with_google_vision(payload.imageUrl, old_index=payload.oldIndex)
 
     raise HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

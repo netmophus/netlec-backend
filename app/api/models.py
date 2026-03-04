@@ -194,6 +194,7 @@ class CreateReadingRequest(BaseModel):
 
 class ReadingOcrRequest(BaseModel):
     imageUrl: str
+    oldIndex: int | None = Field(default=None, ge=0, le=999999999)
 
 
 class ReadingOcrResponse(BaseModel):
