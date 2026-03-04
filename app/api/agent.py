@@ -1,12 +1,23 @@
 from datetime import date, datetime, timedelta, timezone
 import calendar
+import re
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+import httpx
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
-from app.api.models import AgentReadingSummaryItem, CreateReadingRequest, ReadingPublic, TourPublic, UpdateReadingRequest
+from app.api.models import (
+    AgentReadingSummaryItem,
+    CreateReadingRequest,
+    ReadingOcrRequest,
+    ReadingOcrResponse,
+    ReadingPublic,
+    TourPublic,
+    UpdateReadingRequest,
+)
 from app.core.deps import get_current_user_payload, get_database, require_roles
+from app.core.settings import settings
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
@@ -139,6 +150,171 @@ def _end_of_month_due_date(reading_date_iso: str, grace_days: int) -> date | Non
         return None
     last_day = calendar.monthrange(rd_d.year, rd_d.month)[1]
     return date(rd_d.year, rd_d.month, last_day) + timedelta(days=int(grace_days))
+
+
+def _extract_index_from_text(raw_text: str | None) -> str | None:
+    if not raw_text:
+        return None
+
+    candidates: list[tuple[str, int]] = []
+    for match in re.finditer(r"\d{4,9}", raw_text):
+        token = match.group(0)
+        if token:
+            candidates.append((token, match.start()))
+
+    if not candidates:
+        return None
+
+    best_token, _ = max(candidates, key=lambda item: (len(item[0]), item[1]))
+    return best_token
+
+
+async def _ocr_with_ocr_space(image_url: str) -> ReadingOcrResponse:
+    api_key = settings.OCR_SPACE_API_KEY
+    if not api_key:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="OCR_SPACE_API_KEY manquant.")
+
+    payload = {
+        "url": image_url,
+        "language": "fre",
+        "isOverlayRequired": False,
+        "OCREngine": 2,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(settings.OCR_SPACE_ENDPOINT, data=payload, headers={"apikey": api_key})
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Echec appel OCR.space.")
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="OCR.space indisponible.")
+
+    body = response.json()
+    if bool(body.get("IsErroredOnProcessing")):
+        error_message = body.get("ErrorMessage")
+        if isinstance(error_message, list) and error_message:
+            detail = ", ".join(str(entry) for entry in error_message)
+        elif isinstance(error_message, str):
+            detail = error_message
+        else:
+            detail = "OCR.space a retourne une erreur."
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail)
+
+    raw_text_parts: list[str] = []
+    parsed_results = body.get("ParsedResults")
+    if isinstance(parsed_results, list):
+        for result in parsed_results:
+            if not isinstance(result, dict):
+                continue
+            parsed_text = result.get("ParsedText")
+            if isinstance(parsed_text, str) and parsed_text.strip():
+                raw_text_parts.append(parsed_text.strip())
+
+    raw_text = "\n".join(raw_text_parts).strip() if raw_text_parts else None
+    proposed_index = _extract_index_from_text(raw_text)
+
+    return ReadingOcrResponse(
+        provider="ocr_space",
+        rawText=raw_text,
+        proposedIndex=proposed_index,
+        confidence=None,
+    )
+
+
+async def _ocr_with_google_vision(image_url: str) -> ReadingOcrResponse:
+    api_key = settings.GOOGLE_VISION_API_KEY
+    if not api_key:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="GOOGLE_VISION_API_KEY manquant.")
+
+    endpoint = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
+    payload = {
+        "requests": [
+            {
+                "image": {"source": {"imageUri": image_url}},
+                "features": [{"type": "TEXT_DETECTION"}],
+            }
+        ]
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(endpoint, json=payload)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Echec appel Google Vision.")
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Google Vision indisponible.")
+
+    body = response.json()
+    responses = body.get("responses")
+    first = responses[0] if isinstance(responses, list) and responses else {}
+    if not isinstance(first, dict):
+        first = {}
+
+    api_error = first.get("error")
+    if isinstance(api_error, dict):
+        detail = api_error.get("message")
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(detail) if detail else "Erreur Google Vision.")
+
+    raw_text: str | None = None
+    full_text_annotation = first.get("fullTextAnnotation")
+    if isinstance(full_text_annotation, dict):
+        candidate = full_text_annotation.get("text")
+        if isinstance(candidate, str) and candidate.strip():
+            raw_text = candidate.strip()
+
+    if not raw_text:
+        text_annotations = first.get("textAnnotations")
+        if isinstance(text_annotations, list) and text_annotations:
+            first_annotation = text_annotations[0]
+            if isinstance(first_annotation, dict):
+                candidate = first_annotation.get("description")
+                if isinstance(candidate, str) and candidate.strip():
+                    raw_text = candidate.strip()
+
+    proposed_index = _extract_index_from_text(raw_text)
+    return ReadingOcrResponse(
+        provider="google_vision",
+        rawText=raw_text,
+        proposedIndex=proposed_index,
+        confidence=None,
+    )
+
+
+@router.post(
+    "/readings/ocr",
+    response_model=ReadingOcrResponse,
+    dependencies=[Depends(require_roles("agent"))],
+)
+async def ocr_agent_reading(
+    payload: ReadingOcrRequest,
+    token_payload: dict = Depends(get_current_user_payload),
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    agent_id = token_payload.get("sub")
+    if not agent_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token invalide.")
+
+    try:
+        agent_oid = ObjectId(str(agent_id))
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token invalide.")
+
+    agent = await db.users.find_one({"_id": agent_oid})
+    if not agent:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Utilisateur introuvable.")
+
+    provider = settings.OCR_PROVIDER.strip().lower()
+    if provider in {"ocr_space", "ocr.space", "ocrspace"}:
+        return await _ocr_with_ocr_space(payload.imageUrl)
+    if provider in {"google", "google_vision", "google-vision"}:
+        return await _ocr_with_google_vision(payload.imageUrl)
+
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=f"OCR_PROVIDER invalide: {settings.OCR_PROVIDER}",
+    )
 
 
 @router.get(

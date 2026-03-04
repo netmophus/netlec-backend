@@ -192,6 +192,17 @@ class CreateReadingRequest(BaseModel):
     gpsMissingReason: str | None = None
 
 
+class ReadingOcrRequest(BaseModel):
+    imageUrl: str
+
+
+class ReadingOcrResponse(BaseModel):
+    provider: str
+    rawText: str | None = None
+    proposedIndex: str | None = None
+    confidence: float | None = None
+
+
 class UpdateReadingRequest(BaseModel):
     newIndex: int = Field(ge=0, le=999999999)
     gps: dict | None = None
