@@ -157,7 +157,8 @@ def _extract_index_from_text(raw_text: str | None, old_index: int | None = None)
         return None
 
     candidates: list[tuple[str, int, int]] = []
-    for match in re.finditer(r"\d{4,9}", raw_text):
+    # Meter indexes are usually 4-7 digits. Ignoring longer numbers avoids serial/account noise.
+    for match in re.finditer(r"\d{4,7}", raw_text):
         token = match.group(0)
         if token:
             try:
@@ -172,10 +173,12 @@ def _extract_index_from_text(raw_text: str | None, old_index: int | None = None)
     if isinstance(old_index, int) and old_index >= 0:
         viable = [item for item in candidates if item[2] >= old_index]
         if viable:
-            best_token, _, _ = min(viable, key=lambda item: (item[2] - old_index, abs(len(item[0]) - 6), item[1]))
+            target_len = len(str(old_index))
+            best_token, _, _ = min(viable, key=lambda item: (item[2] - old_index, abs(len(item[0]) - target_len), item[1]))
             return best_token
 
-    best_token, _, _ = max(candidates, key=lambda item: (int(4 <= len(item[0]) <= 7), -abs(len(item[0]) - 6), item[1]))
+    # Fallback: choose the earliest candidate with a plausible index width.
+    best_token, _, _ = min(candidates, key=lambda item: (abs(len(item[0]) - 6), item[1]))
     return best_token
 
 
