@@ -23,12 +23,34 @@ from app.api.models import (
     UserPublic,
     ZonePublic,
     TariffPublic,
+    PortalSettingsPublic,
     UpsertTariffsRequest,
 )
 from app.core.deps import get_database, require_roles
 from app.core.security import hash_password
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+DEFAULT_LATEST_ANNOUNCEMENTS = [
+    {
+        "id": "ann-1",
+        "title": "Maintenance planifiee",
+        "message": "Intervention reseau ce samedi de 22h a 01h sur Conakry Nord.",
+        "date": "04 Mars 2026",
+    },
+    {
+        "id": "ann-2",
+        "title": "Nouveaux points de paiement",
+        "message": "Le paiement NITA est disponible dans 12 nouveaux points partenaires.",
+        "date": "03 Mars 2026",
+    },
+    {
+        "id": "ann-3",
+        "title": "Tournees prioritaires",
+        "message": "Les releves des zones Koubia Nord et Bambeto sont prioritaires aujourd'hui.",
+        "date": "02 Mars 2026",
+    },
+]
 
 
 def _normalize(value: str | None) -> str | None:
@@ -43,6 +65,52 @@ def _pick(row: dict, *keys: str) -> str | None:
         if k in row:
             return _normalize(row.get(k))
     return None
+
+
+def _as_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    return v if v else None
+
+
+def _normalize_announcements(value: object) -> list[dict]:
+    normalized: list[dict] = []
+    if isinstance(value, list):
+        for i, item in enumerate(value[:3]):
+            if not isinstance(item, dict):
+                continue
+
+            title = _as_text(item.get("title"))
+            message = _as_text(item.get("message"))
+            date = _as_text(item.get("date"))
+            if not title or not message or not date:
+                continue
+
+            normalized.append(
+                {
+                    "id": _as_text(item.get("id")) or f"ann-{i + 1}",
+                    "title": title,
+                    "message": message,
+                    "date": date,
+                }
+            )
+
+    return normalized if normalized else DEFAULT_LATEST_ANNOUNCEMENTS
+
+
+def _normalize_portal_settings(source: object) -> dict:
+    data = source if isinstance(source, dict) else {}
+    return {
+        "logoUrl": _as_text(data.get("logoUrl")),
+        "facebookUrl": _as_text(data.get("facebookUrl")),
+        "linkedinUrl": _as_text(data.get("linkedinUrl")),
+        "xUrl": _as_text(data.get("xUrl")),
+        "youtubeUrl": _as_text(data.get("youtubeUrl")),
+        "supportPhone": _as_text(data.get("supportPhone")),
+        "supportWhatsapp": _as_text(data.get("supportWhatsapp")),
+        "latestAnnouncements": _normalize_announcements(data.get("latestAnnouncements")),
+    }
 
 
 def _tariff_rate_per_kwh(tariff_code: str | None) -> int | None:
@@ -132,6 +200,43 @@ async def _tariff_rate_per_kwh_db(db: AsyncIOMotorDatabase, tariff_code: str | N
     if doc and isinstance(doc.get("ratePerKwh"), int):
         return int(doc.get("ratePerKwh"))
     return _tariff_rate_per_kwh(code)
+
+
+@router.get(
+    "/portal-settings",
+    response_model=PortalSettingsPublic,
+    dependencies=[Depends(require_roles("admin"))],
+)
+async def get_portal_settings(db: AsyncIOMotorDatabase = Depends(get_database)):
+    doc = await db.portal_settings.find_one({"key": "default"})
+    source = (doc or {}).get("settings") if isinstance((doc or {}).get("settings"), dict) else (doc or {})
+    return _normalize_portal_settings(source)
+
+
+@router.put(
+    "/portal-settings",
+    response_model=PortalSettingsPublic,
+    dependencies=[Depends(require_roles("admin"))],
+)
+async def upsert_portal_settings(
+    payload: PortalSettingsPublic,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    settings_payload = _normalize_portal_settings(payload.model_dump())
+    now = datetime.now(timezone.utc)
+    await db.portal_settings.update_one(
+        {"key": "default"},
+        {
+            "$set": {
+                "key": "default",
+                "settings": settings_payload,
+                "updatedAt": now,
+            },
+            "$setOnInsert": {"createdAt": now},
+        },
+        upsert=True,
+    )
+    return settings_payload
 
 
 @router.get(

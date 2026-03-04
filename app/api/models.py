@@ -54,6 +54,24 @@ class TokenResponse(BaseModel):
     mustChangePassword: bool = False
 
 
+class PortalAnnouncementPublic(BaseModel):
+    id: str
+    title: str
+    message: str
+    date: str
+
+
+class PortalSettingsPublic(BaseModel):
+    logoUrl: str | None = None
+    facebookUrl: str | None = None
+    linkedinUrl: str | None = None
+    xUrl: str | None = None
+    youtubeUrl: str | None = None
+    supportPhone: str | None = None
+    supportWhatsapp: str | None = None
+    latestAnnouncements: list[PortalAnnouncementPublic] = []
+
+
 class ChangePasswordRequest(BaseModel):
     currentPassword: str
     newPassword: str

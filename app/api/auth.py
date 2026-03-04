@@ -7,12 +7,82 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from bson import ObjectId
 
-from app.api.models import ChangePasswordRequest, RegisterLookupRequest, RegisterRequest, TokenResponse, UserPublic
+from app.api.models import ChangePasswordRequest, PortalSettingsPublic, RegisterLookupRequest, RegisterRequest, TokenResponse, UserPublic
 from app.core.deps import get_current_user_payload, get_database
 from app.core.security import create_access_token, hash_password, verify_password
 from app.core.settings import settings
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+DEFAULT_LATEST_ANNOUNCEMENTS = [
+    {
+        "id": "ann-1",
+        "title": "Maintenance planifiee",
+        "message": "Intervention reseau ce samedi de 22h a 01h sur Conakry Nord.",
+        "date": "04 Mars 2026",
+    },
+    {
+        "id": "ann-2",
+        "title": "Nouveaux points de paiement",
+        "message": "Le paiement NITA est disponible dans 12 nouveaux points partenaires.",
+        "date": "03 Mars 2026",
+    },
+    {
+        "id": "ann-3",
+        "title": "Tournees prioritaires",
+        "message": "Les releves des zones Koubia Nord et Bambeto sont prioritaires aujourd'hui.",
+        "date": "02 Mars 2026",
+    },
+]
+
+
+def _as_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text if text else None
+
+
+def _normalize_announcements(value: object) -> list[dict]:
+    normalized: list[dict] = []
+    if isinstance(value, list):
+        for i, item in enumerate(value[:3]):
+            if not isinstance(item, dict):
+                continue
+
+            title = _as_text(item.get("title"))
+            message = _as_text(item.get("message"))
+            date = _as_text(item.get("date"))
+            if not title or not message or not date:
+                continue
+
+            normalized.append(
+                {
+                    "id": _as_text(item.get("id")) or f"ann-{i + 1}",
+                    "title": title,
+                    "message": message,
+                    "date": date,
+                }
+            )
+
+    return normalized if normalized else DEFAULT_LATEST_ANNOUNCEMENTS
+
+
+@router.get("/portal-settings", response_model=PortalSettingsPublic)
+async def get_portal_settings(db: AsyncIOMotorDatabase = Depends(get_database)):
+    doc = await db.portal_settings.find_one({"key": "default"})
+    source = (doc or {}).get("settings") if isinstance((doc or {}).get("settings"), dict) else (doc or {})
+
+    return {
+        "logoUrl": _as_text(source.get("logoUrl")),
+        "facebookUrl": _as_text(source.get("facebookUrl")),
+        "linkedinUrl": _as_text(source.get("linkedinUrl")),
+        "xUrl": _as_text(source.get("xUrl")),
+        "youtubeUrl": _as_text(source.get("youtubeUrl")),
+        "supportPhone": _as_text(source.get("supportPhone")),
+        "supportWhatsapp": _as_text(source.get("supportWhatsapp")),
+        "latestAnnouncements": _normalize_announcements(source.get("latestAnnouncements")),
+    }
 
 
 @router.get("/me", response_model=UserPublic)
