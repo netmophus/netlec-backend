@@ -8,7 +8,28 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from pymongo.errors import DuplicateKeyError
 from starlette.responses import StreamingResponse
 
-from app.api.models import CreateAgentBySupervisorRequest, GenerateToursRequest, GenerateToursResponse, MeterPublic, ReadingWithLocationPublic, TourItem, TourPublic, UserPublic, ZoneRef
+from app.api.agent import (
+    _build_invoice_detail,
+    _compute_progressive_amount,
+    _end_of_month_due_date,
+    _infer_tariff_code_from_consumption,
+    _load_tariff_tiers_db,
+    _tariff_rate_per_kwh_db,
+)
+from app.api.models import (
+    CreateAgentBySupervisorRequest,
+    GenerateToursRequest,
+    GenerateToursResponse,
+    MeterPublic,
+    ReadingPublic,
+    ReadingWithLocationPublic,
+    ReviewReadingCorrectionPayload,
+    TourItem,
+    TourPublic,
+    UserPublic,
+    ZoneRef,
+)
+from app.core.cycles import resolve_cycle_id
 from app.core.deps import get_current_user_payload, get_database, require_roles
 from app.core.security import hash_password
 
@@ -98,6 +119,208 @@ def _normalize_zone_refs(items: list[dict]) -> list[dict]:
     return out
 
 
+@router.patch(
+    "/readings/{reading_id}/correction-review",
+    response_model=ReadingPublic,
+    dependencies=[Depends(require_roles("supervisor"))],
+)
+async def review_reading_correction(
+    reading_id: str,
+    payload: ReviewReadingCorrectionPayload,
+    token_payload: dict = Depends(get_current_user_payload),
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    supervisor, zones_or = await _get_supervisor_context(token_payload, db)
+    if not zones_or:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Aucune zone affectée.")
+
+    try:
+        roid = ObjectId(str(reading_id))
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Identifiant invalide.")
+
+    reading = await db.readings.find_one({"_id": roid})
+    if not reading:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Relevé introuvable.")
+
+    if str(reading.get("source") or "AGENT").upper() != "AGENT":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Correction réservée aux relevés agent.")
+
+    if str(reading.get("correctionStatus") or "NONE").upper() != "PENDING_SUPERVISOR":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Aucune correction en attente pour ce relevé.")
+
+    tour_id_raw = reading.get("tourId")
+    try:
+        tour_oid = ObjectId(str(tour_id_raw))
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Tournée introuvable pour ce relevé.")
+
+    tour = await db.tours.find_one({"_id": tour_oid, "$or": zones_or}, {"_id": 1, "center": 1, "zone": 1, "sector": 1})
+    if not tour:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Relevé hors de vos zones supervisées.")
+
+    cycle_id_raw = reading.get("cycleId")
+    if isinstance(cycle_id_raw, str) and cycle_id_raw.strip():
+        cycle_id = cycle_id_raw.strip()
+    else:
+        cycle_id = await resolve_cycle_id(db, date_value=str(reading.get("date")))
+
+    now = datetime.now(timezone.utc)
+    review_note = payload.note.strip() if isinstance(payload.note, str) and payload.note.strip() else None
+
+    if not payload.approve:
+        await db.readings.update_one(
+            {"_id": roid},
+            {
+                "$set": {
+                    "correctionStatus": "REJECTED",
+                    "correctionReviewedBy": str(supervisor.get("_id")),
+                    "correctionReviewedAt": now,
+                    "correctionReviewNote": review_note,
+                    "updatedAt": now,
+                },
+                "$push": {
+                    "correctionAudit": {
+                        "action": "REJECTED",
+                        "reviewedBy": str(supervisor.get("_id")),
+                        "reviewedAt": now,
+                        "note": review_note,
+                        "proposedIndex": reading.get("correctionProposedIndex"),
+                    }
+                },
+            },
+        )
+        rejected = await db.readings.find_one({"_id": roid})
+        if not rejected:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Erreur traitement correction.")
+        rejected["_id"] = str(rejected["_id"])
+        return ReadingPublic(**rejected)
+
+    proposed_index = reading.get("correctionProposedIndex")
+    if not isinstance(proposed_index, int):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Index proposé invalide.")
+
+    old_index = reading.get("oldIndex")
+    if isinstance(old_index, int) and int(proposed_index) < old_index:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Index proposé inférieur à l'ancien index.")
+
+    meter_number = str(reading.get("meterNumber") or "")
+    if not meter_number:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Compteur invalide sur le relevé.")
+
+    customer = await db.users.find_one({"role": "customer", "meterNumber": meter_number})
+    if not customer:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client introuvable pour ce compteur.")
+
+    consumption: int | None = None
+    if isinstance(old_index, int):
+        consumption = int(proposed_index - old_index)
+
+    tiers = await _load_tariff_tiers_db(db)
+    tariff_code: str | None = None
+    reading_tariff = reading.get("tariffCode")
+    customer_tariff = customer.get("tariffCode")
+    raw_tariff = reading_tariff if isinstance(reading_tariff, str) and reading_tariff.strip() else customer_tariff
+    if isinstance(raw_tariff, str) and raw_tariff.strip():
+        tariff_code = raw_tariff.strip().upper()
+    if not tariff_code and isinstance(consumption, int):
+        tariff_code = _infer_tariff_code_from_consumption(int(consumption), tiers)
+
+    update_doc: dict = {
+        "newIndex": int(proposed_index),
+        "consumption": consumption,
+        "updatedAt": now,
+        "correctionStatus": "APPROVED",
+        "correctionReviewedBy": str(supervisor.get("_id")),
+        "correctionReviewedAt": now,
+        "correctionReviewNote": review_note,
+    }
+    if tariff_code is not None:
+        update_doc["tariffCode"] = tariff_code
+
+    await db.readings.update_one(
+        {"_id": roid},
+        {
+            "$set": update_doc,
+            "$push": {
+                "correctionAudit": {
+                    "action": "APPROVED",
+                    "reviewedBy": str(supervisor.get("_id")),
+                    "reviewedAt": now,
+                    "oldIndex": reading.get("newIndex"),
+                    "approvedIndex": int(proposed_index),
+                    "reason": reading.get("correctionReason"),
+                    "note": review_note,
+                }
+            },
+        },
+    )
+
+    latest = await db.readings.find_one(
+        {"cycleId": cycle_id, "meterNumber": meter_number},
+        sort=[("date", -1), ("createdAt", -1)],
+        projection={"_id": 1},
+    )
+    if latest and str(latest.get("_id")) == str(roid):
+        await db.users.update_one({"_id": customer["_id"]}, {"$set": {"oldIndex": int(proposed_index), "updatedAt": now}})
+
+    tc = tariff_code
+    amount: int | None = None
+    if isinstance(consumption, int):
+        amount = _compute_progressive_amount(int(consumption), tiers)
+        if amount is None:
+            rate = await _tariff_rate_per_kwh_db(db, tc)
+            if rate is not None:
+                amount = int(int(consumption) * int(rate))
+
+    detail = _build_invoice_detail(consumption if isinstance(consumption, int) else None, tiers, amount)
+    due_d = _end_of_month_due_date(str(reading.get("date")), 10)
+    due_date_str = due_d.isoformat() if due_d else None
+    status_str = "DUE"
+    if due_d is not None and now.date() > due_d:
+        status_str = "OVERDUE"
+
+    invoice_id = f"INV-{str(roid)}"
+    await db.invoices.update_one(
+        {"invoiceId": invoice_id},
+        {
+            "$set": {
+                "invoiceId": invoice_id,
+                "cycleId": cycle_id,
+                "readingId": str(roid),
+                "customerId": str(customer.get("_id")),
+                "meterNumber": meter_number,
+                "period": str(reading.get("date"))[:7] if len(str(reading.get("date"))) >= 7 else str(reading.get("date")),
+                "date": str(reading.get("date")),
+                "dueDate": due_date_str,
+                "tariffCode": tc,
+                "consumption": consumption if isinstance(consumption, int) else None,
+                "amount": detail["amount"],
+                "energyAmount": detail["energyAmount"],
+                "tvFee": detail["tvFee"],
+                "fsspFee": detail["fsspFee"],
+                "subtotal": detail["subtotal"],
+                "taxAmount": detail["taxAmount"],
+                "totalAmount": detail["totalAmount"],
+                "breakdown": detail["breakdown"],
+                "status": status_str,
+                "center": tour.get("center") or customer.get("center"),
+                "zone": tour.get("zone") or customer.get("zone"),
+                "sector": tour.get("sector") or customer.get("sector"),
+                "updatedAt": now,
+            },
+            "$setOnInsert": {"createdAt": now},
+        },
+        upsert=True,
+    )
+
+    approved = await db.readings.find_one({"_id": roid})
+    if not approved:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Erreur validation correction.")
+    approved["_id"] = str(approved["_id"])
+    return ReadingPublic(**approved)
+
+
 @router.get(
     "/zones",
     response_model=list[ZoneRef],
@@ -182,6 +405,7 @@ async def list_readings(
     date: str | None = Query(default=None),
     agentId: str | None = Query(default=None),
     meterNumber: str | None = Query(default=None),
+    correctionStatus: str | None = Query(default=None),
     limit: int = Query(default=200, ge=1, le=1000),
 ):
     supervisor_id = token_payload.get("sub")
@@ -202,7 +426,9 @@ async def list_readings(
     if not zones_or:
         return []
 
-    tours_query: dict = {"$or": zones_or}
+    cycle_id = await resolve_cycle_id(db, date_value=date)
+
+    tours_query: dict = {"$or": zones_or, "cycleId": cycle_id}
     if date:
         tours_query["date"] = date
     tour_docs = await db.tours.find(tours_query, {"_id": 1, "center": 1, "zone": 1, "sector": 1}).to_list(length=5000)
@@ -216,13 +442,15 @@ async def list_readings(
         tour_ids.append(tid)
         tour_id_to_loc[tid] = {"center": t.get("center"), "zone": t.get("zone"), "sector": t.get("sector")}
 
-    readings_query: dict = {"tourId": {"$in": tour_ids}}
+    readings_query: dict = {"tourId": {"$in": tour_ids}, "cycleId": cycle_id}
     if date:
         readings_query["date"] = date
     if agentId:
         readings_query["agentId"] = agentId
     if meterNumber:
         readings_query["meterNumber"] = meterNumber
+    if correctionStatus and correctionStatus.strip():
+        readings_query["correctionStatus"] = correctionStatus.strip().upper()
 
     cursor = db.readings.find(readings_query).sort([("date", -1), ("createdAt", -1)]).limit(limit)
     docs = await cursor.to_list(length=limit)
@@ -425,7 +653,9 @@ async def supervisor_meters_report_pdf(
     if not zones_or:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Aucune zone affectée au superviseur.")
 
-    query: dict = {"$or": zones_or}
+    cycle_id = await resolve_cycle_id(db)
+
+    query: dict = {"$or": zones_or, "cycleId": cycle_id}
     cursor = db.meters.find(query).sort([("center", 1), ("zone", 1), ("sector", 1), ("routeOrder", 1)]).limit(limit)
     items = await cursor.to_list(length=limit)
 
@@ -616,7 +846,9 @@ async def supervisor_tours_report_pdf(
     if not zones_or:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Aucune zone affectée au superviseur.")
 
-    query: dict = {"$or": zones_or}
+    cycle_id = await resolve_cycle_id(db, date_value=date)
+
+    query: dict = {"$or": zones_or, "cycleId": cycle_id}
     if date:
         query["date"] = date
     cursor = db.tours.find(query).sort([("date", -1), ("createdAt", -1)]).limit(limit)
@@ -731,11 +963,13 @@ async def list_meters(
     if not zones_or:
         return []
 
-    query: dict = {"$or": zones_or}
+    cycle_id = await resolve_cycle_id(db)
+
+    query: dict = {"$or": zones_or, "cycleId": cycle_id}
     if q and q.strip():
         query = {
             "$and": [
-                {"$or": zones_or},
+                {"$or": zones_or, "cycleId": cycle_id},
                 {
                     "$or": [
                         {"meterNumber": {"$regex": q.strip(), "$options": "i"}},
@@ -912,6 +1146,8 @@ async def generate_tours(
         if not allowed:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Zone non autorisée pour ce superviseur.")
 
+    cycle_id = await resolve_cycle_id(db, date_value=payload.date)
+
     now = datetime.now(timezone.utc)
     created = 0
     skipped = 0
@@ -959,7 +1195,11 @@ async def generate_tours(
         zone = str(zf["zone"])
         sector = str(zf["sector"])
 
-        meters = await db.meters.find({"center": center, "zone": zone, "sector": sector}).sort("routeOrder", 1).to_list(length=50000)
+        meters = (
+            await db.meters.find({"cycleId": cycle_id, "center": center, "zone": zone, "sector": sector})
+            .sort("routeOrder", 1)
+            .to_list(length=50000)
+        )
         if not meters:
             skipped += 1
             continue
@@ -968,6 +1208,7 @@ async def generate_tours(
         already_assigned: set[str] = set()
         existing_tours = await db.tours.find(
             {
+                "cycleId": cycle_id,
                 "date": payload.date,
                 "center": center,
                 "zone": zone,
@@ -1032,6 +1273,7 @@ async def generate_tours(
             for chunk in chunks:
                 tour_seq += 1
                 tour_doc = {
+                    "cycleId": cycle_id,
                     "date": payload.date,
                     "center": center,
                     "zone": zone,
@@ -1101,7 +1343,9 @@ async def list_tours(
     if not zones_or:
         return []
 
-    query: dict = {"$or": zones_or}
+    cycle_id = await resolve_cycle_id(db, date_value=date)
+
+    query: dict = {"$or": zones_or, "cycleId": cycle_id}
     if date:
         query["date"] = date
 

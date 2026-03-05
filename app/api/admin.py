@@ -16,6 +16,9 @@ from app.api.models import (
     CreateStaffUserRequest,
     CreateZoneRequest,
     AdminStatsResponse,
+    ActiveCycleResponse,
+    MeterPublic,
+    ReadingPublic,
     ImportMetersResponse,
     ImportCustomersResponse,
     PreRegisterCustomerRequest,
@@ -24,10 +27,13 @@ from app.api.models import (
     ZonePublic,
     TariffPublic,
     PortalSettingsPublic,
+    ResetPasswordRequest,
     UpsertTariffsRequest,
 )
+from app.core.cycles import current_cycle_id, ensure_cycle_open, get_active_cycle_id, resolve_cycle_id
 from app.core.deps import get_database, require_roles
 from app.core.security import hash_password
+from app.core.settings import settings
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -192,6 +198,136 @@ def _compute_progressive_amount(consumption: int, tiers: list[dict]) -> int | No
     return int(amount)
 
 
+def _compute_progressive_breakdown(consumption: int, tiers: list[dict]) -> list[dict]:
+    if not isinstance(consumption, int) or consumption < 0:
+        return []
+    if consumption == 0 or not tiers:
+        return []
+
+    lines: list[dict] = []
+    for t in tiers:
+        try:
+            start = int(t.get("fromKwh"))
+        except Exception:
+            continue
+        end_raw = t.get("toKwh")
+        end: int | None
+        if end_raw is None:
+            end = None
+        else:
+            try:
+                end = int(end_raw)
+            except Exception:
+                end = None
+
+        rate = t.get("ratePerKwh")
+        if not isinstance(rate, int) or rate < 0:
+            continue
+
+        low = max(1, start)
+        high = consumption if end is None else min(consumption, end)
+        if high < low:
+            continue
+
+        kwh_in_tier = int(high - low + 1)
+        amount = int(kwh_in_tier * rate)
+        code_raw = t.get("code")
+        code = str(code_raw).strip().upper() if isinstance(code_raw, str) and str(code_raw).strip() else None
+        lines.append(
+            {
+                "label": f"Energie {code}" if code else "Energie",
+                "code": code,
+                "kwh": kwh_in_tier,
+                "ratePerKwh": int(rate),
+                "amount": amount,
+            }
+        )
+
+        if end is None:
+            break
+
+    return lines
+
+
+def _build_invoice_detail(consumption: int | None, tiers: list[dict], base_amount: int | None) -> dict:
+    energy_amount = int(base_amount) if isinstance(base_amount, int) else None
+    breakdown: list[dict] = []
+    if isinstance(consumption, int):
+        breakdown = _compute_progressive_breakdown(int(consumption), tiers)
+
+    if energy_amount is None and breakdown:
+        energy_amount = int(sum(int(item.get("amount") or 0) for item in breakdown))
+
+    if energy_amount is None:
+        return {
+            "energyAmount": None,
+            "tvFee": None,
+            "fsspFee": None,
+            "subtotal": None,
+            "taxAmount": None,
+            "totalAmount": None,
+            "breakdown": [],
+            "amount": None,
+        }
+
+    vat_rate_percent = max(0, int(settings.VAT_RATE_PERCENT or 0))
+    tv_fee = max(0, int(settings.TV_FEE_FCFA or 0))
+    fssp_fee = max(0, int(settings.FSSP_FEE_FCFA or 0))
+    subtotal = int(energy_amount)
+    tax_amount = int(round(subtotal * vat_rate_percent / 100.0))
+    total_amount = int(subtotal + tax_amount + tv_fee + fssp_fee)
+
+    if not breakdown:
+        breakdown = [
+            {
+                "label": "Energie",
+                "code": None,
+                "kwh": int(consumption) if isinstance(consumption, int) else None,
+                "ratePerKwh": None,
+                "amount": int(energy_amount),
+            }
+        ]
+
+    breakdown.append(
+        {
+            "label": f"TVA ({vat_rate_percent}%)",
+            "code": "VAT",
+            "kwh": None,
+            "ratePerKwh": None,
+            "amount": int(tax_amount),
+        }
+    )
+    breakdown.append(
+        {
+            "label": "Taxe fixe",
+            "code": "TV",
+            "kwh": None,
+            "ratePerKwh": None,
+            "amount": int(tv_fee),
+        }
+    )
+    breakdown.append(
+        {
+            "label": "Charge fixe 2",
+            "code": "FSSP",
+            "kwh": None,
+            "ratePerKwh": None,
+            "amount": int(fssp_fee),
+        }
+    )
+
+    return {
+        "energyAmount": int(energy_amount),
+        "tvFee": int(tv_fee),
+        "fsspFee": int(fssp_fee),
+        "subtotal": int(subtotal),
+        "taxAmount": int(tax_amount),
+        "totalAmount": int(total_amount),
+        "breakdown": breakdown,
+        "amount": int(total_amount),
+    }
+
+
 async def _tariff_rate_per_kwh_db(db: AsyncIOMotorDatabase, tariff_code: str | None) -> int | None:
     if not tariff_code:
         return None
@@ -319,13 +455,38 @@ async def upsert_tariffs(
     return out
 
 
-def _end_of_month_due_date(reading_date_iso: str, grace_days: int) -> date | None:
+def _end_of_month_due_date(reading_date_iso: str, grace_days: int = 10) -> date | None:
     try:
         rd_d = date.fromisoformat(str(reading_date_iso))
     except Exception:
         return None
     last_day = calendar.monthrange(rd_d.year, rd_d.month)[1]
     return date(rd_d.year, rd_d.month, last_day) + timedelta(days=int(grace_days))
+
+
+@router.get(
+    "/cycles/active",
+    response_model=ActiveCycleResponse,
+    dependencies=[Depends(require_roles("admin"))],
+)
+async def get_active_cycle(
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    cycle_id = await get_active_cycle_id(db)
+    cycle = await db.billing_cycles.find_one({"cycleId": cycle_id}, {"_id": 0, "cycleId": 1, "status": 1, "openedAt": 1, "updatedAt": 1})
+    if not cycle:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Cycle actif introuvable.")
+
+    normalized_status = str(cycle.get("status") or "OPEN").upper()
+    if normalized_status not in {"OPEN", "CLOSED"}:
+        normalized_status = "OPEN"
+
+    return ActiveCycleResponse(
+        cycleId=str(cycle.get("cycleId")),
+        status=normalized_status,
+        openedAt=cycle.get("openedAt"),
+        updatedAt=cycle.get("updatedAt"),
+    )
 
 
 @router.post(
@@ -441,6 +602,7 @@ async def import_customers(
     file: UploadFile = File(...),
     delimiter: str = Query(default=",", min_length=1, max_length=1),
     updateExisting: bool = Query(default=False),
+    cycleId: str | None = Query(default=None),
     db: AsyncIOMotorDatabase = Depends(get_database),
     token_payload: dict = Depends(require_roles("admin")),
 ):
@@ -457,6 +619,9 @@ async def import_customers(
     reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
     if not reader.fieldnames:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Le CSV n'a pas d'en-tête (header).")
+
+    cycle_id = str(cycleId).strip() if isinstance(cycleId, str) and cycleId.strip() else current_cycle_id()
+    await ensure_cycle_open(db, cycle_id)
 
     now = datetime.now(timezone.utc)
     inserted = 0
@@ -485,6 +650,7 @@ async def import_customers(
                 continue
 
             doc = {
+                "cycleId": cycle_id,
                 "phone": phone,
                 "role": "customer",
                 "passwordHash": None,
@@ -553,6 +719,7 @@ async def import_meters(
     delimiter: str = Query(default=";", min_length=1, max_length=1),
     upsert: bool = Query(default=True),
     validateZones: bool = Query(default=True),
+    cycleId: str | None = Query(default=None),
     db: AsyncIOMotorDatabase = Depends(get_database),
 ):
     raw = await file.read()
@@ -564,6 +731,9 @@ async def import_meters(
     reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
     if not reader.fieldnames:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Le CSV n'a pas d'en-tête (header).")
+
+    cycle_id = str(cycleId).strip() if isinstance(cycleId, str) and cycleId.strip() else current_cycle_id()
+    await ensure_cycle_open(db, cycle_id)
 
     now = datetime.now(timezone.utc)
     inserted = 0
@@ -624,12 +794,13 @@ async def import_meters(
                         error_lines.append(i)
                         continue
 
-            existing = await db.meters.find_one({"meterNumber": meter_number})
+            existing = await db.meters.find_one({"cycleId": cycle_id, "meterNumber": meter_number})
             if not existing and not upsert:
                 skipped += 1
                 continue
 
             doc_set = {
+                "cycleId": cycle_id,
                 "routeOrder": route_order,
                 "updatedAt": now,
             }
@@ -651,6 +822,7 @@ async def import_meters(
                 updated += 1
             else:
                 doc = {
+                    "cycleId": cycle_id,
                     "meterNumber": meter_number,
                     "center": center,
                     "zone": zone,
@@ -676,6 +848,247 @@ async def import_meters(
         errors=errors,
         errorLines=error_lines,
     )
+
+
+@router.get(
+    "/meters",
+    response_model=list[MeterPublic],
+    dependencies=[Depends(require_roles("admin"))],
+)
+async def list_meters(
+    db: AsyncIOMotorDatabase = Depends(get_database),
+    q: str | None = Query(default=None),
+    cycleId: str | None = Query(default=None),
+    limit: int = Query(default=1000, ge=1, le=5000),
+):
+    cycle_id = await resolve_cycle_id(db, cycle_id=cycleId)
+
+    query: dict = {"cycleId": cycle_id}
+    if isinstance(q, str) and q.strip():
+        needle = q.strip()
+        query = {
+            "$and": [
+                {"cycleId": cycle_id},
+                {
+                    "$or": [
+                        {"meterNumber": {"$regex": needle, "$options": "i"}},
+                        {"subscriberNumber": {"$regex": needle, "$options": "i"}},
+                        {"police": {"$regex": needle, "$options": "i"}},
+                    ]
+                },
+            ]
+        }
+
+    cursor = db.meters.find(query).sort([("center", 1), ("zone", 1), ("sector", 1), ("routeOrder", 1)]).limit(limit)
+    items = await cursor.to_list(length=limit)
+    for it in items:
+        it["_id"] = str(it["_id"])
+    return items
+
+
+@router.get(
+    "/tours/activity",
+    dependencies=[Depends(require_roles("admin"))],
+)
+async def list_tours_activity(
+    db: AsyncIOMotorDatabase = Depends(get_database),
+    date: str | None = Query(default=None),
+    center: str | None = Query(default=None),
+    zone: str | None = Query(default=None),
+    sector: str | None = Query(default=None),
+    agentId: str | None = Query(default=None),
+    cycleId: str | None = Query(default=None),
+    limit: int = Query(default=1000, ge=1, le=5000),
+):
+    cycle_id = await resolve_cycle_id(db, cycle_id=cycleId, date_value=date)
+
+    query: dict = {"cycleId": cycle_id}
+    if date:
+        query["date"] = date
+    if center:
+        query["center"] = center
+    if zone:
+        query["zone"] = zone
+    if sector:
+        query["sector"] = sector
+    if agentId:
+        query["agentId"] = agentId
+
+    tour_docs = await (
+        db.tours.find(query)
+        .sort([("date", -1), ("center", 1), ("zone", 1), ("sector", 1), ("createdAt", -1)])
+        .limit(limit)
+        .to_list(length=limit)
+    )
+    if not tour_docs:
+        return []
+
+    tour_ids: list[str] = []
+    agent_ids: set[str] = set()
+    for t in tour_docs:
+        tid = str(t.get("_id"))
+        tour_ids.append(tid)
+        aid = t.get("agentId")
+        if isinstance(aid, str) and aid:
+            agent_ids.add(aid)
+
+    agent_by_id: dict[str, dict] = {}
+    if agent_ids:
+        cursor_agents = db.users.find(
+            {"_id": {"$in": [ObjectId(aid) for aid in agent_ids if ObjectId.is_valid(aid)]}},
+            {"name": 1, "phone": 1},
+        )
+        async for a in cursor_agents:
+            agent_by_id[str(a.get("_id"))] = a
+
+    reading_docs = await db.readings.find(
+        {"cycleId": cycle_id, "tourId": {"$in": tour_ids}},
+        {"tourId": 1, "meterNumber": 1, "createdAt": 1},
+    ).to_list(length=200000)
+
+    readings_by_tour: dict[str, set[str]] = {}
+    last_reading_at_by_tour: dict[str, datetime] = {}
+    for r in reading_docs:
+        tid = str(r.get("tourId") or "")
+        if not tid:
+            continue
+        readings_by_tour.setdefault(tid, set())
+        meter_number = r.get("meterNumber")
+        if isinstance(meter_number, str) and meter_number:
+            readings_by_tour[tid].add(meter_number)
+        created_at = r.get("createdAt")
+        if isinstance(created_at, datetime):
+            prev = last_reading_at_by_tour.get(tid)
+            if prev is None or created_at > prev:
+                last_reading_at_by_tour[tid] = created_at
+
+    out: list[dict] = []
+    for t in tour_docs:
+        tid = str(t.get("_id"))
+        items = t.get("items") or []
+        total = len(items)
+        read_count = len(readings_by_tour.get(tid, set()))
+        pending = max(total - read_count, 0)
+        status = "NOT_STARTED"
+        if read_count > 0 and pending > 0:
+            status = "IN_PROGRESS"
+        if total > 0 and pending == 0:
+            status = "DONE"
+
+        aid = str(t.get("agentId") or "")
+        agent = agent_by_id.get(aid) or {}
+
+        out.append(
+            {
+                "_id": tid,
+                "cycleId": t.get("cycleId"),
+                "date": t.get("date"),
+                "center": t.get("center"),
+                "zone": t.get("zone"),
+                "sector": t.get("sector"),
+                "agentId": aid or None,
+                "agentName": agent.get("name"),
+                "agentPhone": agent.get("phone"),
+                "totalMeters": total,
+                "readMeters": read_count,
+                "pendingMeters": pending,
+                "activityStatus": status,
+                "lastReadingAt": last_reading_at_by_tour.get(tid),
+                "createdAt": t.get("createdAt"),
+            }
+        )
+
+    return out
+
+
+@router.get(
+    "/tours/{tour_id}/trace",
+    dependencies=[Depends(require_roles("admin"))],
+)
+async def get_tour_trace(
+    tour_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+    cycleId: str | None = Query(default=None),
+):
+    if not ObjectId.is_valid(tour_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="tour_id invalide.")
+
+    tour_doc = await db.tours.find_one({"_id": ObjectId(tour_id)})
+    if not tour_doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournée introuvable.")
+
+    cycle_id = await resolve_cycle_id(
+        db,
+        cycle_id=cycleId,
+        date_value=str(tour_doc.get("date") or "") if not cycleId else None,
+    )
+    if str(tour_doc.get("cycleId") or "") != cycle_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournée introuvable pour ce cycle.")
+
+    readings = await db.readings.find(
+        {"cycleId": cycle_id, "tourId": str(tour_doc.get("_id"))},
+        {"meterNumber": 1, "gps": 1, "createdAt": 1, "source": 1},
+    ).sort([("createdAt", 1)]).to_list(length=5000)
+
+    points: list[dict] = []
+    for r in readings:
+        gps = r.get("gps")
+        if not isinstance(gps, dict):
+            continue
+        lat = gps.get("lat")
+        lng = gps.get("lng")
+        if not isinstance(lat, (int, float)) or not isinstance(lng, (int, float)):
+            continue
+        points.append(
+            {
+                "meterNumber": r.get("meterNumber"),
+                "lat": float(lat),
+                "lng": float(lng),
+                "recordedAt": r.get("createdAt"),
+                "source": r.get("source"),
+            }
+        )
+
+    return {
+        "tour": {
+            "_id": str(tour_doc.get("_id")),
+            "cycleId": tour_doc.get("cycleId"),
+            "date": tour_doc.get("date"),
+            "center": tour_doc.get("center"),
+            "zone": tour_doc.get("zone"),
+            "sector": tour_doc.get("sector"),
+            "agentId": tour_doc.get("agentId"),
+            "totalMeters": len(tour_doc.get("items") or []),
+        },
+        "points": points,
+    }
+
+
+@router.get(
+    "/readings",
+    response_model=list[ReadingPublic],
+    dependencies=[Depends(require_roles("admin"))],
+)
+async def list_readings(
+    db: AsyncIOMotorDatabase = Depends(get_database),
+    date: str | None = Query(default=None),
+    correctionStatus: str | None = Query(default=None),
+    cycleId: str | None = Query(default=None),
+    limit: int = Query(default=1000, ge=1, le=5000),
+):
+    cycle_id = await resolve_cycle_id(db, cycle_id=cycleId, date_value=date)
+
+    query: dict = {"cycleId": cycle_id}
+    if date:
+        query["date"] = date
+    if correctionStatus and correctionStatus.strip():
+        query["correctionStatus"] = correctionStatus.strip().upper()
+
+    cursor = db.readings.find(query).sort([("date", -1), ("createdAt", -1)]).limit(limit)
+    items = await cursor.to_list(length=limit)
+    for it in items:
+        it["_id"] = str(it["_id"])
+    return items
 
 
 @router.get(
@@ -892,6 +1305,7 @@ async def sync_invoices(
                     rate = await _tariff_rate_per_kwh_db(db, tc)
                     if rate is not None:
                         amount = int(int(cons) * int(rate))
+            detail = _build_invoice_detail(cons if isinstance(cons, int) else None, tiers if isinstance(cons, int) else [], amount)
 
             invoice_id = f"INV-{str(rid)}"
             if invoice_id in paid_invoice_ids:
@@ -913,7 +1327,14 @@ async def sync_invoices(
                 "dueDate": due_date_str,
                 "tariffCode": str(tc) if tc is not None else None,
                 "consumption": cons if isinstance(cons, int) else None,
-                "amount": amount,
+                "amount": detail["amount"],
+                "energyAmount": detail["energyAmount"],
+                "tvFee": detail["tvFee"],
+                "fsspFee": detail["fsspFee"],
+                "subtotal": detail["subtotal"],
+                "taxAmount": detail["taxAmount"],
+                "totalAmount": detail["totalAmount"],
+                "breakdown": detail["breakdown"],
                 "status": status_str,
                 "center": customer.get("center"),
                 "zone": customer.get("zone"),
@@ -1234,6 +1655,7 @@ def _generate_temporary_password(length: int = 12) -> str:
 )
 async def reset_password(
     user_id: str,
+    payload: ResetPasswordRequest | None = None,
     db: AsyncIOMotorDatabase = Depends(get_database),
 ):
     try:
@@ -1245,7 +1667,14 @@ async def reset_password(
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Utilisateur introuvable.")
 
-    temp_password = _generate_temporary_password()
+    default_password = (payload.defaultPassword.strip() if payload and payload.defaultPassword else "")
+    if default_password and len(default_password) < 6:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Le mot de passe par défaut doit contenir au moins 6 caractères.",
+        )
+
+    temp_password = default_password or _generate_temporary_password()
     now = datetime.now(timezone.utc)
     await db.users.update_one(
         {"_id": user["_id"]},

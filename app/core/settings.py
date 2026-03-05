@@ -33,6 +33,17 @@ class Settings(BaseSettings):
     OCR_SPACE_ENDPOINT: str = "https://api.ocr.space/parse/image"
     GOOGLE_VISION_API_KEY: str | None = None
 
+    CLOUDINARY_CLOUD_NAME: str | None = None
+    CLOUDINARY_API_KEY: str | None = None
+    CLOUDINARY_API_SECRET: str | None = None
+    CLOUDINARY_UPLOAD_FOLDER: str = "nigelec/self-readings"
+
+    VAT_RATE_PERCENT: int = 19
+    TV_FEE_FCFA: int = 7000
+    FSSP_FEE_FCFA: int = 1500
+    LOYALTY_POINTS_PER_CONFORM_READING: int = 20
+    LOYALTY_DRAW_THRESHOLD: int = 120
+
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def parse_cors_origins(cls, value: Any) -> Any:

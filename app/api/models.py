@@ -77,6 +77,10 @@ class ChangePasswordRequest(BaseModel):
     newPassword: str
 
 
+class ResetPasswordRequest(BaseModel):
+    defaultPassword: str | None = None
+
+
 class CreateStaffUserRequest(BaseModel):
     phone: str
     name: str
@@ -138,6 +142,13 @@ class ImportMetersResponse(BaseModel):
     errorLines: list[int] = []
 
 
+class ActiveCycleResponse(BaseModel):
+    cycleId: str
+    status: Literal["OPEN", "CLOSED"]
+    openedAt: datetime | None = None
+    updatedAt: datetime | None = None
+
+
 class AdminStatsResponse(BaseModel):
     internalUsers: int
     preRegisteredCustomers: int
@@ -170,6 +181,7 @@ class UserInDB(BaseModel):
 
 class MeterPublic(BaseModel):
     id: str = Field(alias="_id")
+    cycleId: str | None = None
     meterNumber: str
     center: str | None = None
     zone: str | None = None
@@ -181,6 +193,7 @@ class MeterPublic(BaseModel):
 
 
 class MeterInDB(BaseModel):
+    cycleId: str | None = None
     meterNumber: str
     center: str | None = None
     zone: str | None = None
@@ -198,6 +211,8 @@ class TourItem(BaseModel):
     meterNumber: str
     routeOrder: int | None = None
     oldIndex: int | None = None
+    selfSubmittedByCustomer: bool = False
+    selfSubmittedAt: datetime | None = None
 
 
 class CreateReadingRequest(BaseModel):
@@ -229,17 +244,41 @@ class UpdateReadingRequest(BaseModel):
     gpsMissingReason: str | None = None
 
 
+class RequestReadingCorrectionPayload(BaseModel):
+    proposedNewIndex: int = Field(ge=0, le=999999999)
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class ReviewReadingCorrectionPayload(BaseModel):
+    approve: bool
+    note: str | None = Field(default=None, max_length=500)
+
+
 class ReadingPublic(BaseModel):
     id: str = Field(alias="_id")
+    cycleId: str | None = None
     date: str
-    tourId: str
-    agentId: str
+    tourId: str | None = None
+    agentId: str | None = None
     meterNumber: str
     oldIndex: int | None = None
     newIndex: int
     consumption: int | None = None
     tariffCode: str | None = None
     amount: int | None = None
+    source: Literal["AGENT", "CUSTOMER"] | None = None
+    selfReadingStatus: str | None = None
+    photoUrl: str | None = None
+    loyaltyPointsAwarded: int | None = None
+    correctionStatus: Literal["NONE", "PENDING_SUPERVISOR", "APPROVED", "REJECTED"] | None = None
+    correctionRequestedBy: str | None = None
+    correctionRequestedAt: datetime | None = None
+    correctionReason: str | None = None
+    correctionProposedIndex: int | None = None
+    correctionReviewedBy: str | None = None
+    correctionReviewedAt: datetime | None = None
+    correctionReviewNote: str | None = None
+    correctionAudit: list[dict] | None = None
     createdAt: datetime
     updatedAt: datetime
 
@@ -275,8 +314,45 @@ class CustomerBillingResponse(BaseModel):
     items: list[BillingLineItem] = []
 
 
+class LoyaltyReadingHistoryItem(BaseModel):
+    date: str
+    meterNumber: str
+    newIndex: int
+    status: str
+    pointsAwarded: int
+    createdAt: datetime
+
+
+class CustomerLoyaltySummary(BaseModel):
+    pointsSemester: int
+    pointsLifetime: int
+    eligibleForDraw: bool
+    excluded: bool
+    threshold: int
+    pointsPerConformReading: int
+    nextDrawFrequency: str = "SEMESTRIEL"
+    history: list[LoyaltyReadingHistoryItem] = []
+
+
+class SelfReadingAvailabilityResponse(BaseModel):
+    date: str
+    meterNumber: str | None = None
+    oldIndex: int | None = None
+    canSubmit: bool
+    reason: str | None = None
+
+
+class InvoiceChargeLine(BaseModel):
+    label: str
+    code: str | None = None
+    kwh: int | None = None
+    ratePerKwh: int | None = None
+    amount: int
+
+
 class InvoicePublic(BaseModel):
     id: str
+    cycleId: str | None = None
     period: str
     date: str
     dueDate: str | None = None
@@ -284,6 +360,13 @@ class InvoicePublic(BaseModel):
     tariffCode: str | None = None
     consumption: int | None = None
     amount: int | None = None
+    energyAmount: int | None = None
+    tvFee: int | None = None
+    fsspFee: int | None = None
+    subtotal: int | None = None
+    taxAmount: int | None = None
+    totalAmount: int | None = None
+    breakdown: list[InvoiceChargeLine] = []
     status: str
     readingId: str
 
@@ -306,6 +389,7 @@ class PaymentPublic(BaseModel):
 
 class TourPublic(BaseModel):
     id: str = Field(alias="_id")
+    cycleId: str | None = None
     date: str
     center: str
     zone: str
@@ -317,6 +401,7 @@ class TourPublic(BaseModel):
 
 
 class TourInDB(BaseModel):
+    cycleId: str | None = None
     date: str
     center: str
     zone: str

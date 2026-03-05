@@ -13,9 +13,11 @@ from app.api.models import (
     ReadingOcrRequest,
     ReadingOcrResponse,
     ReadingPublic,
+    RequestReadingCorrectionPayload,
     TourPublic,
     UpdateReadingRequest,
 )
+from app.core.cycles import resolve_cycle_id
 from app.core.deps import get_current_user_payload, get_database, require_roles
 from app.core.settings import settings
 
@@ -96,6 +98,135 @@ def _compute_progressive_amount(consumption: int, tiers: list[dict]) -> int | No
         if end is None:
             break
     return int(amount)
+
+
+def _compute_progressive_breakdown(consumption: int, tiers: list[dict]) -> list[dict]:
+    if not isinstance(consumption, int) or consumption < 0:
+        return []
+    if consumption == 0 or not tiers:
+        return []
+
+    lines: list[dict] = []
+    for t in tiers:
+        try:
+            start = int(t.get("fromKwh"))
+        except Exception:
+            continue
+        end_raw = t.get("toKwh")
+        end: int | None
+        if end_raw is None:
+            end = None
+        else:
+            try:
+                end = int(end_raw)
+            except Exception:
+                end = None
+
+        rate = t.get("ratePerKwh")
+        if not isinstance(rate, int) or rate < 0:
+            continue
+
+        low = max(1, start)
+        high = consumption if end is None else min(consumption, end)
+        if high < low:
+            continue
+
+        kwh_in_tier = int(high - low + 1)
+        amount = int(kwh_in_tier * rate)
+        code_raw = t.get("code")
+        code = str(code_raw).strip().upper() if isinstance(code_raw, str) and str(code_raw).strip() else None
+        lines.append(
+            {
+                "label": f"Energie {code}" if code else "Energie",
+                "code": code,
+                "kwh": kwh_in_tier,
+                "ratePerKwh": int(rate),
+                "amount": amount,
+            }
+        )
+        if end is None:
+            break
+
+    return lines
+
+
+def _build_invoice_detail(consumption: int | None, tiers: list[dict], base_amount: int | None) -> dict:
+    energy_amount = int(base_amount) if isinstance(base_amount, int) else None
+    breakdown: list[dict] = []
+    if isinstance(consumption, int):
+        breakdown = _compute_progressive_breakdown(int(consumption), tiers)
+
+    if energy_amount is None and breakdown:
+        energy_amount = int(sum(int(item.get("amount") or 0) for item in breakdown))
+
+    if energy_amount is None:
+        return {
+            "energyAmount": None,
+            "tvFee": None,
+            "fsspFee": None,
+            "subtotal": None,
+            "taxAmount": None,
+            "totalAmount": None,
+            "breakdown": [],
+            "amount": None,
+        }
+
+    vat_rate_percent = max(0, int(settings.VAT_RATE_PERCENT or 0))
+    tv_fee = max(0, int(settings.TV_FEE_FCFA or 0))
+    fssp_fee = max(0, int(settings.FSSP_FEE_FCFA or 0))
+    subtotal = int(energy_amount)
+    tax_amount = int(round(subtotal * vat_rate_percent / 100.0))
+    total_amount = int(subtotal + tax_amount + tv_fee + fssp_fee)
+
+    if not breakdown:
+        breakdown = [
+            {
+                "label": "Energie",
+                "code": None,
+                "kwh": int(consumption) if isinstance(consumption, int) else None,
+                "ratePerKwh": None,
+                "amount": int(energy_amount),
+            }
+        ]
+
+    breakdown.append(
+        {
+            "label": f"TVA ({vat_rate_percent}%)",
+            "code": "VAT",
+            "kwh": None,
+            "ratePerKwh": None,
+            "amount": int(tax_amount),
+        }
+    )
+    breakdown.append(
+        {
+            "label": "Taxe fixe",
+            "code": "TV",
+            "kwh": None,
+            "ratePerKwh": None,
+            "amount": int(tv_fee),
+        }
+    )
+    breakdown.append(
+        {
+            "label": "Charge fixe 2",
+            "code": "FSSP",
+            "kwh": None,
+            "ratePerKwh": None,
+            "amount": int(fssp_fee),
+        }
+    )
+
+    return {
+        "energyAmount": int(energy_amount),
+        "tvFee": int(tv_fee),
+        "fsspFee": int(fssp_fee),
+        "subtotal": int(subtotal),
+        "taxAmount": int(tax_amount),
+        "totalAmount": int(total_amount),
+        "breakdown": breakdown,
+        "amount": int(total_amount),
+    }
 
 
 def _infer_tariff_code_from_consumption(consumption: int, tiers: list[dict]) -> str | None:
@@ -354,7 +485,9 @@ async def list_agent_tours(
     if not agent:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Utilisateur introuvable.")
 
-    query: dict = {"agentId": str(agent["_id"])}
+    cycle_id = await resolve_cycle_id(db, date_value=date)
+
+    query: dict = {"agentId": str(agent["_id"]), "cycleId": cycle_id}
     if date:
         query["date"] = date
 
@@ -380,6 +513,25 @@ async def list_agent_tours(
                 old_index_by_meter[str(mn)] = u.get("oldIndex")
 
     out: list[TourPublic] = []
+    self_submitted_map: dict[str, datetime] = {}
+    if meter_numbers:
+        self_cursor = db.readings.find(
+            {
+                "cycleId": cycle_id,
+                "date": str(date) if date else {"$exists": True},
+                "meterNumber": {"$in": list(meter_numbers)},
+                "source": "CUSTOMER",
+            },
+            {"meterNumber": 1, "createdAt": 1},
+        )
+        async for sr in self_cursor:
+            mn = sr.get("meterNumber")
+            if not mn:
+                continue
+            created_at = sr.get("createdAt")
+            if isinstance(created_at, datetime):
+                self_submitted_map[str(mn)] = created_at
+
     for d in docs:
         d["_id"] = str(d["_id"])
         items = d.get("items") or []
@@ -387,6 +539,9 @@ async def list_agent_tours(
             mn = it.get("meterNumber")
             if mn:
                 it["oldIndex"] = old_index_by_meter.get(str(mn))
+                submitted_at = self_submitted_map.get(str(mn))
+                it["selfSubmittedByCustomer"] = submitted_at is not None
+                it["selfSubmittedAt"] = submitted_at
         out.append(TourPublic(**d))
 
     return out
@@ -416,7 +571,9 @@ async def create_reading(
     if not agent:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Utilisateur introuvable.")
 
-    tour = await db.tours.find_one({"_id": ObjectId(payload.tourId)})
+    cycle_id = await resolve_cycle_id(db, date_value=payload.date)
+
+    tour = await db.tours.find_one({"_id": ObjectId(payload.tourId), "cycleId": cycle_id})
     if not tour:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournée introuvable.")
     if str(tour.get("agentId")) != str(agent.get("_id")):
@@ -454,6 +611,7 @@ async def create_reading(
 
     now = datetime.now(timezone.utc)
     doc = {
+        "cycleId": cycle_id,
         "date": payload.date,
         "tourId": payload.tourId,
         "agentId": str(agent.get("_id")),
@@ -465,11 +623,17 @@ async def create_reading(
         "gps": payload.gps,
         "gpsMissing": payload.gpsMissing,
         "gpsMissingReason": payload.gpsMissingReason,
+        "source": "AGENT",
+        "selfReadingStatus": None,
+        "photoUrl": None,
+        "loyaltyPointsAwarded": 0,
+        "correctionStatus": "NONE",
+        "correctionAudit": [],
         "createdAt": now,
         "updatedAt": now,
     }
 
-    existing = await db.readings.find_one({"date": payload.date, "meterNumber": payload.meterNumber})
+    existing = await db.readings.find_one({"cycleId": cycle_id, "meterNumber": payload.meterNumber})
     if existing:
         existing["_id"] = str(existing["_id"])
         return ReadingPublic(**existing)
@@ -504,11 +668,14 @@ async def create_reading(
     if due_d is not None and now.date() > due_d:
         status_str = "OVERDUE"
 
+    detail = _build_invoice_detail(cons if isinstance(cons, int) else None, tiers, amount)
+
     await db.invoices.update_one(
         {"invoiceId": invoice_id},
         {
             "$set": {
                 "invoiceId": invoice_id,
+                "cycleId": cycle_id,
                 "readingId": str(res.inserted_id),
                 "customerId": str(customer.get("_id")),
                 "meterNumber": str(payload.meterNumber),
@@ -517,7 +684,14 @@ async def create_reading(
                 "dueDate": due_date_str,
                 "tariffCode": str(tc) if tc is not None else None,
                 "consumption": cons if isinstance(cons, int) else None,
-                "amount": amount,
+                "amount": detail["amount"],
+                "energyAmount": detail["energyAmount"],
+                "tvFee": detail["tvFee"],
+                "fsspFee": detail["fsspFee"],
+                "subtotal": detail["subtotal"],
+                "taxAmount": detail["taxAmount"],
+                "totalAmount": detail["totalAmount"],
+                "breakdown": detail["breakdown"],
                 "status": status_str,
                 "center": customer.get("center"),
                 "zone": customer.get("zone"),
@@ -559,7 +733,9 @@ async def list_agent_readings(
     if not agent:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Utilisateur introuvable.")
 
-    q: dict = {"agentId": str(agent.get("_id"))}
+    cycle_id = await resolve_cycle_id(db, date_value=date)
+
+    q: dict = {"agentId": str(agent.get("_id")), "cycleId": cycle_id}
     if date:
         q["date"] = str(date)
     if tourId:
@@ -574,6 +750,82 @@ async def list_agent_readings(
         d["_id"] = str(d["_id"])
         out.append(ReadingPublic(**d))
     return out
+
+
+@router.patch(
+    "/readings/{reading_id}/correction-request",
+    response_model=ReadingPublic,
+    dependencies=[Depends(require_roles("agent"))],
+)
+async def request_agent_reading_correction(
+    reading_id: str,
+    payload: RequestReadingCorrectionPayload,
+    token_payload: dict = Depends(get_current_user_payload),
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    agent_id = token_payload.get("sub")
+    if not agent_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token invalide.")
+
+    try:
+        agent_oid = ObjectId(str(agent_id))
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token invalide.")
+
+    agent = await db.users.find_one({"_id": agent_oid})
+    if not agent:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Utilisateur introuvable.")
+
+    try:
+        roid = ObjectId(str(reading_id))
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Identifiant invalide.")
+
+    reading = await db.readings.find_one({"_id": roid})
+    if not reading:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Relevé introuvable.")
+
+    if str(reading.get("agentId")) != str(agent.get("_id")):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Relevé non autorisé.")
+
+    if str(reading.get("source") or "AGENT").upper() != "AGENT":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Correction réservée aux relevés agent.")
+
+    old_index = reading.get("oldIndex")
+    if isinstance(old_index, int) and int(payload.proposedNewIndex) < old_index:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Index proposé inférieur à l'ancien index.")
+
+    now = datetime.now(timezone.utc)
+    reason = payload.reason.strip()
+    await db.readings.update_one(
+        {"_id": roid},
+        {
+            "$set": {
+                "correctionStatus": "PENDING_SUPERVISOR",
+                "correctionRequestedBy": str(agent.get("_id")),
+                "correctionRequestedAt": now,
+                "correctionReason": reason,
+                "correctionProposedIndex": int(payload.proposedNewIndex),
+                "updatedAt": now,
+            },
+            "$push": {
+                "correctionAudit": {
+                    "action": "REQUESTED",
+                    "requestedBy": str(agent.get("_id")),
+                    "requestedAt": now,
+                    "oldIndex": reading.get("newIndex"),
+                    "proposedIndex": int(payload.proposedNewIndex),
+                    "reason": reason,
+                }
+            },
+        },
+    )
+
+    updated = await db.readings.find_one({"_id": roid})
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Erreur demande correction.")
+    updated["_id"] = str(updated["_id"])
+    return ReadingPublic(**updated)
 
 
 @router.patch(
@@ -618,6 +870,8 @@ async def update_agent_reading(
     customer = await db.users.find_one({"role": "customer", "meterNumber": meter_number})
     if not customer:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client introuvable pour ce compteur.")
+
+    cycle_id_for_reading = str(reading.get("cycleId")).strip() if isinstance(reading.get("cycleId"), str) and str(reading.get("cycleId")).strip() else await resolve_cycle_id(db, date_value=reading_date)
 
     old_index = reading.get("oldIndex")
     if isinstance(old_index, int) and payload.newIndex < old_index:
@@ -664,7 +918,7 @@ async def update_agent_reading(
     # Update customer's oldIndex only if this reading is the latest for this meter.
     # This avoids overwriting a newer index if multiple readings exist for the same meter.
     latest = await db.readings.find_one(
-        {"meterNumber": meter_number},
+        {"cycleId": cycle_id_for_reading, "meterNumber": meter_number},
         sort=[("date", -1), ("createdAt", -1)],
         projection={"_id": 1},
     )
@@ -699,6 +953,7 @@ async def update_agent_reading(
         {
             "$set": {
                 "invoiceId": invoice_id,
+                "cycleId": cycle_id_for_reading,
                 "readingId": str(roid),
                 "customerId": str(customer.get("_id")),
                 "meterNumber": meter_number,
@@ -748,7 +1003,9 @@ async def list_agent_readings_summary(
     if not agent:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Utilisateur introuvable.")
 
-    q: dict = {"agentId": str(agent.get("_id"))}
+    cycle_id = await resolve_cycle_id(db, date_value=date)
+
+    q: dict = {"agentId": str(agent.get("_id")), "cycleId": cycle_id}
     if date:
         q["date"] = str(date)
     if tourId:

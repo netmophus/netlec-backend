@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pymongo.errors import OperationFailure
 
 from app.api.admin import router as admin_router
@@ -9,8 +10,13 @@ from app.api.customer import router as customer_router
 from app.api.supervisor import router as supervisor_router
 from app.core.settings import settings
 from app.db.mongo import get_db
+from pathlib import Path
 
 app = FastAPI(title="nigelec-backend")
+
+UPLOADS_ROOT = Path("uploads")
+UPLOADS_ROOT.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(UPLOADS_ROOT)), name="uploads")
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,19 +65,19 @@ async def startup() -> None:
 
     await _create_or_replace_index(
         "meters",
-        keys="meterNumber",
+        keys=[("cycleId", 1), ("meterNumber", 1)],
         unique=True,
-        name="meter_meterNumber_unique",
+        name="meter_cycle_meterNumber_unique",
     )
     await _create_or_replace_index(
         "meters",
-        keys=[("center", 1), ("zone", 1), ("sector", 1), ("routeOrder", 1)],
-        name="meter_center_zone_sector_routeOrder",
+        keys=[("cycleId", 1), ("center", 1), ("zone", 1), ("sector", 1), ("routeOrder", 1)],
+        name="meter_cycle_center_zone_sector_routeOrder",
     )
     await _create_or_replace_index(
         "meters",
-        keys=[("center", 1), ("zone", 1), ("sector", 1)],
-        name="meter_center_zone_sector",
+        keys=[("cycleId", 1), ("center", 1), ("zone", 1), ("sector", 1)],
+        name="meter_cycle_center_zone_sector",
     )
 
     await _create_or_replace_index(
@@ -82,32 +88,44 @@ async def startup() -> None:
     )
 
     await _create_or_replace_index(
-        "tours",
-        keys=[("agentId", 1), ("date", 1)],
-        name="tour_agent_date",
-    )
-    await _create_or_replace_index(
-        "tours",
-        keys=[("center", 1), ("zone", 1), ("sector", 1), ("date", 1)],
-        name="tour_center_zone_sector_date",
-    )
-    await _create_or_replace_index(
-        "tours",
-        keys=[("date", 1), ("items.meterNumber", 1)],
+        "billing_cycles",
+        keys="cycleId",
         unique=True,
-        name="tour_unique_meter_per_date",
+        name="billing_cycle_id_unique",
+    )
+    await _create_or_replace_index(
+        "billing_cycles",
+        keys=[("status", 1), ("cycleId", -1)],
+        name="billing_cycle_status_cycleId",
+    )
+
+    await _create_or_replace_index(
+        "tours",
+        keys=[("cycleId", 1), ("agentId", 1), ("date", 1)],
+        name="tour_cycle_agent_date",
+    )
+    await _create_or_replace_index(
+        "tours",
+        keys=[("cycleId", 1), ("center", 1), ("zone", 1), ("sector", 1), ("date", 1)],
+        name="tour_cycle_center_zone_sector_date",
+    )
+    await _create_or_replace_index(
+        "tours",
+        keys=[("cycleId", 1), ("date", 1), ("items.meterNumber", 1)],
+        unique=True,
+        name="tour_unique_cycle_meter_per_date",
     )
 
     await _create_or_replace_index(
         "readings",
-        keys=[("date", 1), ("meterNumber", 1)],
+        keys=[("cycleId", 1), ("meterNumber", 1)],
         unique=True,
-        name="reading_unique_date_meter",
+        name="reading_unique_cycle_meter",
     )
     await _create_or_replace_index(
         "readings",
-        keys=[("agentId", 1), ("date", 1)],
-        name="reading_agent_date",
+        keys=[("cycleId", 1), ("agentId", 1), ("date", 1)],
+        name="reading_cycle_agent_date",
     )
 
     await _create_or_replace_index(
@@ -115,6 +133,12 @@ async def startup() -> None:
         keys="invoiceId",
         unique=True,
         name="invoice_invoiceId_unique",
+    )
+    await _create_or_replace_index(
+        "invoices",
+        keys=[("cycleId", 1), ("readingId", 1)],
+        unique=True,
+        name="invoice_cycle_reading_unique",
     )
     await _create_or_replace_index(
         "invoices",
