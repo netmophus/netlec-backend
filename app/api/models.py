@@ -144,8 +144,9 @@ class ImportMetersResponse(BaseModel):
 
 class ActiveCycleResponse(BaseModel):
     cycleId: str
-    status: Literal["OPEN", "CLOSED"]
+    status: Literal["DRAFT", "OPEN", "CLOSED"]
     openedAt: datetime | None = None
+    closedAt: datetime | None = None
     updatedAt: datetime | None = None
 
 

@@ -17,7 +17,7 @@ from app.api.models import (
     TourPublic,
     UpdateReadingRequest,
 )
-from app.core.cycles import resolve_cycle_id
+from app.core.cycles import assert_cycle_is_open, require_open_cycle, resolve_cycle_id_for_read
 from app.core.deps import get_current_user_payload, get_database, require_roles
 from app.core.settings import settings
 
@@ -485,11 +485,15 @@ async def list_agent_tours(
     if not agent:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Utilisateur introuvable.")
 
-    cycle_id = await resolve_cycle_id(db, date_value=date)
-
-    query: dict = {"agentId": str(agent["_id"]), "cycleId": cycle_id}
     if date:
-        query["date"] = date
+        cycle_id: str | None = resolve_cycle_id_for_read(date_value=date)
+    else:
+        open_cycle_doc = await db.billing_cycles.find_one({"status": "OPEN"}, {"cycleId": 1})
+        cycle_id = str(open_cycle_doc["cycleId"]) if open_cycle_doc else None
+
+    query: dict = {"agentId": str(agent["_id"])}
+    if cycle_id:
+        query["cycleId"] = cycle_id
 
     cursor = db.tours.find(query).sort([("date", -1), ("createdAt", -1)]).limit(limit)
     docs = await cursor.to_list(length=limit)
@@ -515,13 +519,16 @@ async def list_agent_tours(
     out: list[TourPublic] = []
     self_submitted_map: dict[str, datetime] = {}
     if meter_numbers:
+        self_filter: dict = {
+            "meterNumber": {"$in": list(meter_numbers)},
+            "source": "CUSTOMER",
+        }
+        if cycle_id:
+            self_filter["cycleId"] = cycle_id
+        if date:
+            self_filter["date"] = str(date)
         self_cursor = db.readings.find(
-            {
-                "cycleId": cycle_id,
-                "date": str(date) if date else {"$exists": True},
-                "meterNumber": {"$in": list(meter_numbers)},
-                "source": "CUSTOMER",
-            },
+            self_filter,
             {"meterNumber": 1, "createdAt": 1},
         )
         async for sr in self_cursor:
@@ -571,7 +578,8 @@ async def create_reading(
     if not agent:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Utilisateur introuvable.")
 
-    cycle_id = await resolve_cycle_id(db, date_value=payload.date)
+    open_cycle_doc = await require_open_cycle(db)
+    cycle_id = open_cycle_doc["cycleId"]
 
     tour = await db.tours.find_one({"_id": ObjectId(payload.tourId), "cycleId": cycle_id})
     if not tour:
@@ -733,11 +741,15 @@ async def list_agent_readings(
     if not agent:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Utilisateur introuvable.")
 
-    cycle_id = await resolve_cycle_id(db, date_value=date)
-
-    q: dict = {"agentId": str(agent.get("_id")), "cycleId": cycle_id}
     if date:
-        q["date"] = str(date)
+        cycle_id: str | None = resolve_cycle_id_for_read(date_value=date)
+    else:
+        open_cycle_doc = await db.billing_cycles.find_one({"status": "OPEN"}, {"cycleId": 1})
+        cycle_id = str(open_cycle_doc["cycleId"]) if open_cycle_doc else None
+
+    q: dict = {"agentId": str(agent.get("_id"))}
+    if cycle_id:
+        q["cycleId"] = cycle_id
     if tourId:
         q["tourId"] = str(tourId)
     if meterNumber:
@@ -871,7 +883,13 @@ async def update_agent_reading(
     if not customer:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client introuvable pour ce compteur.")
 
-    cycle_id_for_reading = str(reading.get("cycleId")).strip() if isinstance(reading.get("cycleId"), str) and str(reading.get("cycleId")).strip() else await resolve_cycle_id(db, date_value=reading_date)
+    raw_cycle = str(reading.get("cycleId") or "").strip()
+    if raw_cycle:
+        await assert_cycle_is_open(db, raw_cycle)
+        reading_cycle_id = raw_cycle
+    else:
+        open_cycle_doc = await require_open_cycle(db)
+        reading_cycle_id = open_cycle_doc["cycleId"]
 
     old_index = reading.get("oldIndex")
     if isinstance(old_index, int) and payload.newIndex < old_index:
@@ -918,7 +936,7 @@ async def update_agent_reading(
     # Update customer's oldIndex only if this reading is the latest for this meter.
     # This avoids overwriting a newer index if multiple readings exist for the same meter.
     latest = await db.readings.find_one(
-        {"cycleId": cycle_id_for_reading, "meterNumber": meter_number},
+        {"cycleId": reading_cycle_id, "meterNumber": meter_number},
         sort=[("date", -1), ("createdAt", -1)],
         projection={"_id": 1},
     )
@@ -953,7 +971,7 @@ async def update_agent_reading(
         {
             "$set": {
                 "invoiceId": invoice_id,
-                "cycleId": cycle_id_for_reading,
+                "cycleId": reading_cycle_id,
                 "readingId": str(roid),
                 "customerId": str(customer.get("_id")),
                 "meterNumber": meter_number,
@@ -1003,11 +1021,15 @@ async def list_agent_readings_summary(
     if not agent:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Utilisateur introuvable.")
 
-    cycle_id = await resolve_cycle_id(db, date_value=date)
-
-    q: dict = {"agentId": str(agent.get("_id")), "cycleId": cycle_id}
     if date:
-        q["date"] = str(date)
+        cycle_id: str | None = resolve_cycle_id_for_read(date_value=date)
+    else:
+        open_cycle_doc = await db.billing_cycles.find_one({"status": "OPEN"}, {"cycleId": 1})
+        cycle_id = str(open_cycle_doc["cycleId"]) if open_cycle_doc else None
+
+    q: dict = {"agentId": str(agent.get("_id"))}
+    if cycle_id:
+        q["cycleId"] = cycle_id
     if tourId:
         q["tourId"] = str(tourId)
 

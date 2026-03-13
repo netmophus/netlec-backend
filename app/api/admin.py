@@ -30,7 +30,7 @@ from app.api.models import (
     ResetPasswordRequest,
     UpsertTariffsRequest,
 )
-from app.core.cycles import current_cycle_id, ensure_cycle_open, get_active_cycle_id, resolve_cycle_id
+from app.core.cycles import assert_cycle_is_open, require_open_cycle, resolve_cycle_id_for_read, suggest_cycle_id
 from app.core.deps import get_database, require_roles
 from app.core.security import hash_password
 from app.core.settings import settings
@@ -464,6 +464,35 @@ def _end_of_month_due_date(reading_date_iso: str, grace_days: int = 10) -> date 
     return date(rd_d.year, rd_d.month, last_day) + timedelta(days=int(grace_days))
 
 
+def _normalize_cycle_id_or_400(value: str) -> str:
+    normalized = str(value or "").strip()
+    if len(normalized) != 7 or normalized[4] != "-" or not normalized[:4].isdigit() or not normalized[5:7].isdigit():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="cycleId invalide (format attendu YYYY-MM).")
+    month = int(normalized[5:7])
+    if month < 1 or month > 12:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="cycleId invalide (mois attendu 01..12).")
+    return normalized
+
+
+async def _latest_validated_index_for_meter(db: AsyncIOMotorDatabase, meter_number: str) -> int | None:
+    if not isinstance(meter_number, str) or not meter_number.strip():
+        return None
+    latest = await db.readings.find_one(
+        {
+            "meterNumber": meter_number.strip(),
+            "newIndex": {"$type": "int"},
+            "$or": [
+                {"source": {"$ne": "AGENT"}},
+                {"correctionStatus": {"$in": [None, "NONE", "APPROVED"]}},
+            ],
+        },
+        sort=[("date", -1), ("createdAt", -1)],
+        projection={"newIndex": 1},
+    )
+    new_index = latest.get("newIndex") if latest else None
+    return int(new_index) if isinstance(new_index, int) else None
+
+
 @router.get(
     "/cycles/active",
     response_model=ActiveCycleResponse,
@@ -472,20 +501,175 @@ def _end_of_month_due_date(reading_date_iso: str, grace_days: int = 10) -> date 
 async def get_active_cycle(
     db: AsyncIOMotorDatabase = Depends(get_database),
 ):
-    cycle_id = await get_active_cycle_id(db)
-    cycle = await db.billing_cycles.find_one({"cycleId": cycle_id}, {"_id": 0, "cycleId": 1, "status": 1, "openedAt": 1, "updatedAt": 1})
+    cycle = await db.billing_cycles.find_one(
+        {"status": "OPEN"},
+        {"_id": 0, "cycleId": 1, "status": 1, "openedAt": 1, "closedAt": 1, "updatedAt": 1},
+    )
     if not cycle:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Cycle actif introuvable.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Aucun cycle n'est actuellement ouvert.",
+        )
+    return ActiveCycleResponse(
+        cycleId=str(cycle["cycleId"]),
+        status="OPEN",
+        openedAt=cycle.get("openedAt"),
+        closedAt=cycle.get("closedAt"),
+        updatedAt=cycle.get("updatedAt"),
+    )
 
-    normalized_status = str(cycle.get("status") or "OPEN").upper()
-    if normalized_status not in {"OPEN", "CLOSED"}:
-        normalized_status = "OPEN"
+
+@router.get(
+    "/cycles",
+    response_model=list[ActiveCycleResponse],
+    dependencies=[Depends(require_roles("admin"))],
+)
+async def list_cycles(
+    db: AsyncIOMotorDatabase = Depends(get_database),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    cursor = db.billing_cycles.find(
+        {},
+        {"_id": 0, "cycleId": 1, "status": 1, "openedAt": 1, "closedAt": 1, "updatedAt": 1},
+    ).sort([("cycleId", -1)]).limit(limit)
+    items = await cursor.to_list(length=limit)
+    result = []
+    for c in items:
+        s = str(c.get("status") or "").upper()
+        if s not in {"DRAFT", "OPEN", "CLOSED"}:
+            s = "CLOSED"
+        result.append(
+            ActiveCycleResponse(
+                cycleId=str(c["cycleId"]),
+                status=s,
+                openedAt=c.get("openedAt"),
+                closedAt=c.get("closedAt"),
+                updatedAt=c.get("updatedAt"),
+            )
+        )
+    return result
+
+
+@router.post(
+    "/cycles",
+    response_model=ActiveCycleResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_roles("admin"))],
+)
+async def create_cycle(
+    cycleId: str | None = Query(default=None),
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    """
+    Crée un cycle en statut DRAFT sans l'ouvrir.
+    Si cycleId n'est pas fourni, suggère le mois courant.
+    Utiliser POST /cycles/open pour l'ouvrir ensuite.
+    """
+    target_cycle_id = (
+        _normalize_cycle_id_or_400(cycleId)
+        if isinstance(cycleId, str) and cycleId.strip()
+        else suggest_cycle_id()
+    )
+    existing = await db.billing_cycles.find_one({"cycleId": target_cycle_id})
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Le cycle {target_cycle_id} existe déjà (statut : {existing.get('status')}).",
+        )
+    now = datetime.now(timezone.utc)
+    await db.billing_cycles.insert_one(
+        {
+            "cycleId": target_cycle_id,
+            "status": "DRAFT",
+            "openedAt": None,
+            "closedAt": None,
+            "createdAt": now,
+            "updatedAt": now,
+        }
+    )
+    return ActiveCycleResponse(
+        cycleId=target_cycle_id,
+        status="DRAFT",
+        openedAt=None,
+        closedAt=None,
+        updatedAt=now,
+    )
+
+
+@router.post(
+    "/cycles/open",
+    response_model=ActiveCycleResponse,
+    dependencies=[Depends(require_roles("admin"))],
+)
+async def open_cycle(
+    cycleId: str = Query(...),
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    target_cycle_id = _normalize_cycle_id_or_400(cycleId)
+    now = datetime.now(timezone.utc)
+
+    await db.billing_cycles.update_many(
+        {"status": "OPEN", "cycleId": {"$ne": target_cycle_id}},
+        {"$set": {"status": "CLOSED", "closedAt": now, "updatedAt": now}},
+    )
+    await db.billing_cycles.update_one(
+        {"cycleId": target_cycle_id},
+        {
+            "$set": {"status": "OPEN", "openedAt": now, "closedAt": None, "updatedAt": now},
+            "$setOnInsert": {"cycleId": target_cycle_id, "createdAt": now},
+        },
+        upsert=True,
+    )
 
     return ActiveCycleResponse(
-        cycleId=str(cycle.get("cycleId")),
-        status=normalized_status,
-        openedAt=cycle.get("openedAt"),
-        updatedAt=cycle.get("updatedAt"),
+        cycleId=target_cycle_id,
+        status="OPEN",
+        openedAt=now,
+        closedAt=None,
+        updatedAt=now,
+    )
+
+
+@router.post(
+    "/cycles/close",
+    response_model=ActiveCycleResponse,
+    dependencies=[Depends(require_roles("admin"))],
+)
+async def close_cycle(
+    cycleId: str | None = Query(default=None),
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    if isinstance(cycleId, str) and cycleId.strip():
+        target_cycle_id = _normalize_cycle_id_or_400(cycleId)
+    else:
+        open_cycle_doc = await db.billing_cycles.find_one({"status": "OPEN"}, {"cycleId": 1})
+        if not open_cycle_doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Aucun cycle n'est actuellement ouvert.",
+            )
+        target_cycle_id = str(open_cycle_doc["cycleId"])
+
+    now = datetime.now(timezone.utc)
+    result = await db.billing_cycles.update_one(
+        {"cycleId": target_cycle_id},
+        {"$set": {"status": "CLOSED", "closedAt": now, "updatedAt": now}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Cycle {target_cycle_id} introuvable.",
+        )
+    cycle = await db.billing_cycles.find_one(
+        {"cycleId": target_cycle_id},
+        {"openedAt": 1, "closedAt": 1, "updatedAt": 1},
+    )
+    return ActiveCycleResponse(
+        cycleId=target_cycle_id,
+        status="CLOSED",
+        openedAt=cycle.get("openedAt") if cycle else None,
+        closedAt=cycle.get("closedAt") if cycle else now,
+        updatedAt=cycle.get("updatedAt") if cycle else now,
     )
 
 
@@ -620,8 +804,8 @@ async def import_customers(
     if not reader.fieldnames:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Le CSV n'a pas d'en-tête (header).")
 
-    cycle_id = str(cycleId).strip() if isinstance(cycleId, str) and cycleId.strip() else current_cycle_id()
-    await ensure_cycle_open(db, cycle_id)
+    open_cycle_doc = await require_open_cycle(db)
+    cycle_id = open_cycle_doc["cycleId"]
 
     now = datetime.now(timezone.utc)
     inserted = 0
@@ -649,6 +833,9 @@ async def import_customers(
                 skipped += 1
                 continue
 
+            carried_old_index = await _latest_validated_index_for_meter(db, meter_number)
+            doc_old_index = carried_old_index if isinstance(carried_old_index, int) else old_index
+
             doc = {
                 "cycleId": cycle_id,
                 "phone": phone,
@@ -658,7 +845,7 @@ async def import_customers(
                 "meterNumber": meter_number,
                 "subscriberNumber": subscriber_number,
                 "police": police,
-                "oldIndex": old_index,
+                "oldIndex": doc_old_index,
                 "name": _pick(row, "name", "fullName", "full_name", "customerName"),
                 "address": _pick(row, "address", "Address", "locality", "quartier"),
                 "tariffCode": _pick(row, "tariffCode", "tariff_code", "TariffCode"),
@@ -687,6 +874,8 @@ async def import_customers(
                 update_doc["updatedAt"] = now
                 update_doc.pop("passwordHash", None)
                 update_doc.pop("isActive", None)
+                if not isinstance(doc_old_index, int):
+                    update_doc.pop("oldIndex", None)
 
                 await db.users.update_one({"_id": existing["_id"]}, {"$set": update_doc})
                 updated += 1
@@ -732,8 +921,8 @@ async def import_meters(
     if not reader.fieldnames:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Le CSV n'a pas d'en-tête (header).")
 
-    cycle_id = str(cycleId).strip() if isinstance(cycleId, str) and cycleId.strip() else current_cycle_id()
-    await ensure_cycle_open(db, cycle_id)
+    open_cycle_doc = await require_open_cycle(db)
+    cycle_id = open_cycle_doc["cycleId"]
 
     now = datetime.now(timezone.utc)
     inserted = 0
@@ -861,14 +1050,17 @@ async def list_meters(
     cycleId: str | None = Query(default=None),
     limit: int = Query(default=1000, ge=1, le=5000),
 ):
-    cycle_id = await resolve_cycle_id(db, cycle_id=cycleId)
+    cycle_id: str | None = None
+    if isinstance(cycleId, str) and cycleId.strip():
+        cycle_id = _normalize_cycle_id_or_400(cycleId)
 
-    query: dict = {"cycleId": cycle_id}
+    query: dict = {"cycleId": cycle_id} if cycle_id else {}
     if isinstance(q, str) and q.strip():
         needle = q.strip()
+        base_filter: dict = {"cycleId": cycle_id} if cycle_id else {}
         query = {
             "$and": [
-                {"cycleId": cycle_id},
+                base_filter,
                 {
                     "$or": [
                         {"meterNumber": {"$regex": needle, "$options": "i"}},
@@ -900,9 +1092,9 @@ async def list_tours_activity(
     cycleId: str | None = Query(default=None),
     limit: int = Query(default=1000, ge=1, le=5000),
 ):
-    cycle_id = await resolve_cycle_id(db, cycle_id=cycleId, date_value=date)
+    cycle_id = resolve_cycle_id_for_read(cycle_id=cycleId, date_value=date)
 
-    query: dict = {"cycleId": cycle_id}
+    query: dict = {"cycleId": cycle_id} if cycle_id else {}
     if date:
         query["date"] = date
     if center:
@@ -1017,12 +1209,11 @@ async def get_tour_trace(
     if not tour_doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournée introuvable.")
 
-    cycle_id = await resolve_cycle_id(
-        db,
+    cycle_id = resolve_cycle_id_for_read(
         cycle_id=cycleId,
         date_value=str(tour_doc.get("date") or "") if not cycleId else None,
     )
-    if str(tour_doc.get("cycleId") or "") != cycle_id:
+    if cycle_id and str(tour_doc.get("cycleId") or "") != cycle_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournée introuvable pour ce cycle.")
 
     readings = await db.readings.find(
@@ -1076,9 +1267,9 @@ async def list_readings(
     cycleId: str | None = Query(default=None),
     limit: int = Query(default=1000, ge=1, le=5000),
 ):
-    cycle_id = await resolve_cycle_id(db, cycle_id=cycleId, date_value=date)
+    cycle_id = resolve_cycle_id_for_read(cycle_id=cycleId, date_value=date)
 
-    query: dict = {"cycleId": cycle_id}
+    query: dict = {"cycleId": cycle_id} if cycle_id else {}
     if date:
         query["date"] = date
     if correctionStatus and correctionStatus.strip():
@@ -1743,3 +1934,4 @@ async def pre_register_customer(
     created.pop("passwordHash", None)
     created["_id"] = str(created["_id"])
     return created
+

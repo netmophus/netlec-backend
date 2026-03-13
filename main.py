@@ -98,6 +98,15 @@ async def startup() -> None:
         keys=[("status", 1), ("cycleId", -1)],
         name="billing_cycle_status_cycleId",
     )
+    # Garantit qu'un seul cycle peut être OPEN en base à la fois.
+    # Les cycles DRAFT et CLOSED ne sont pas concernés par cette contrainte.
+    await _create_or_replace_index(
+        "billing_cycles",
+        keys="status",
+        unique=True,
+        name="billing_cycle_open_unique",
+        partialFilterExpression={"status": "OPEN"},
+    )
 
     await _create_or_replace_index(
         "tours",
@@ -114,6 +123,13 @@ async def startup() -> None:
         keys=[("cycleId", 1), ("date", 1), ("items.meterNumber", 1)],
         unique=True,
         name="tour_unique_cycle_meter_per_date",
+    )
+    # Couvre la recherche par (cycleId, compteur) sans filtre date,
+    # utilisée par _apply_self_submission_to_tour et list_agent_tours.
+    await _create_or_replace_index(
+        "tours",
+        keys=[("cycleId", 1), ("items.meterNumber", 1)],
+        name="tour_cycle_items_meterNumber",
     )
 
     await _create_or_replace_index(

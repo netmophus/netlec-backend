@@ -17,6 +17,7 @@ from app.api.agent import (
     _tariff_rate_per_kwh_db,
 )
 from app.api.models import (
+    ActiveCycleResponse,
     CreateAgentBySupervisorRequest,
     GenerateToursRequest,
     GenerateToursResponse,
@@ -29,7 +30,7 @@ from app.api.models import (
     UserPublic,
     ZoneRef,
 )
-from app.core.cycles import resolve_cycle_id
+from app.core.cycles import assert_cycle_is_open, require_open_cycle, resolve_cycle_id_for_read
 from app.core.deps import get_current_user_payload, get_database, require_roles
 from app.core.security import hash_password
 
@@ -119,6 +120,25 @@ def _normalize_zone_refs(items: list[dict]) -> list[dict]:
     return out
 
 
+@router.get(
+    "/cycle/active",
+    response_model=ActiveCycleResponse,
+    dependencies=[Depends(require_roles("supervisor"))],
+)
+async def get_active_cycle(db: AsyncIOMotorDatabase = Depends(get_database)):
+    """Returns the currently OPEN cycle, or 404 if none."""
+    cycle = await db.billing_cycles.find_one({"status": "OPEN"})
+    if not cycle:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Aucun cycle ouvert.")
+    return ActiveCycleResponse(
+        cycleId=str(cycle["cycleId"]),
+        status=cycle["status"],
+        openedAt=cycle.get("openedAt"),
+        closedAt=cycle.get("closedAt"),
+        updatedAt=cycle.get("updatedAt"),
+    )
+
+
 @router.patch(
     "/readings/{reading_id}/correction-review",
     response_model=ReadingPublic,
@@ -159,11 +179,13 @@ async def review_reading_correction(
     if not tour:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Relevé hors de vos zones supervisées.")
 
-    cycle_id_raw = reading.get("cycleId")
-    if isinstance(cycle_id_raw, str) and cycle_id_raw.strip():
-        cycle_id = cycle_id_raw.strip()
+    raw_cycle = str(reading.get("cycleId") or "").strip()
+    if raw_cycle:
+        await assert_cycle_is_open(db, raw_cycle)
+        cycle_id = raw_cycle
     else:
-        cycle_id = await resolve_cycle_id(db, date_value=str(reading.get("date")))
+        open_cycle_doc = await require_open_cycle(db)
+        cycle_id = open_cycle_doc["cycleId"]
 
     now = datetime.now(timezone.utc)
     review_note = payload.note.strip() if isinstance(payload.note, str) and payload.note.strip() else None
@@ -426,9 +448,15 @@ async def list_readings(
     if not zones_or:
         return []
 
-    cycle_id = await resolve_cycle_id(db, date_value=date)
+    if date:
+        cycle_id: str | None = resolve_cycle_id_for_read(date_value=date)
+    else:
+        open_cycle_doc = await db.billing_cycles.find_one({"status": "OPEN"}, {"cycleId": 1})
+        cycle_id = str(open_cycle_doc["cycleId"]) if open_cycle_doc else None
 
-    tours_query: dict = {"$or": zones_or, "cycleId": cycle_id}
+    tours_query: dict = {"$or": zones_or}
+    if cycle_id:
+        tours_query["cycleId"] = cycle_id
     if date:
         tours_query["date"] = date
     tour_docs = await db.tours.find(tours_query, {"_id": 1, "center": 1, "zone": 1, "sector": 1}).to_list(length=5000)
@@ -442,7 +470,9 @@ async def list_readings(
         tour_ids.append(tid)
         tour_id_to_loc[tid] = {"center": t.get("center"), "zone": t.get("zone"), "sector": t.get("sector")}
 
-    readings_query: dict = {"tourId": {"$in": tour_ids}, "cycleId": cycle_id}
+    readings_query: dict = {"tourId": {"$in": tour_ids}}
+    if cycle_id:
+        readings_query["cycleId"] = cycle_id
     if date:
         readings_query["date"] = date
     if agentId:
@@ -653,9 +683,7 @@ async def supervisor_meters_report_pdf(
     if not zones_or:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Aucune zone affectée au superviseur.")
 
-    cycle_id = await resolve_cycle_id(db)
-
-    query: dict = {"$or": zones_or, "cycleId": cycle_id}
+    query: dict = {"$or": zones_or}
     cursor = db.meters.find(query).sort([("center", 1), ("zone", 1), ("sector", 1), ("routeOrder", 1)]).limit(limit)
     items = await cursor.to_list(length=limit)
 
@@ -846,9 +874,15 @@ async def supervisor_tours_report_pdf(
     if not zones_or:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Aucune zone affectée au superviseur.")
 
-    cycle_id = await resolve_cycle_id(db, date_value=date)
+    if date:
+        cycle_id: str | None = resolve_cycle_id_for_read(date_value=date)
+    else:
+        open_cycle_doc = await db.billing_cycles.find_one({"status": "OPEN"}, {"cycleId": 1})
+        cycle_id = str(open_cycle_doc["cycleId"]) if open_cycle_doc else None
 
-    query: dict = {"$or": zones_or, "cycleId": cycle_id}
+    query: dict = {"$or": zones_or}
+    if cycle_id:
+        query["cycleId"] = cycle_id
     if date:
         query["date"] = date
     cursor = db.tours.find(query).sort([("date", -1), ("createdAt", -1)]).limit(limit)
@@ -963,13 +997,11 @@ async def list_meters(
     if not zones_or:
         return []
 
-    cycle_id = await resolve_cycle_id(db)
-
-    query: dict = {"$or": zones_or, "cycleId": cycle_id}
+    query: dict = {"$or": zones_or}
     if q and q.strip():
         query = {
             "$and": [
-                {"$or": zones_or, "cycleId": cycle_id},
+                {"$or": zones_or},
                 {
                     "$or": [
                         {"meterNumber": {"$regex": q.strip(), "$options": "i"}},
@@ -1146,7 +1178,8 @@ async def generate_tours(
         if not allowed:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Zone non autorisée pour ce superviseur.")
 
-    cycle_id = await resolve_cycle_id(db, date_value=payload.date)
+    open_cycle_doc = await require_open_cycle(db)
+    cycle_id = open_cycle_doc["cycleId"]
 
     now = datetime.now(timezone.utc)
     created = 0
@@ -1196,7 +1229,7 @@ async def generate_tours(
         sector = str(zf["sector"])
 
         meters = (
-            await db.meters.find({"cycleId": cycle_id, "center": center, "zone": zone, "sector": sector})
+            await db.meters.find({"center": center, "zone": zone, "sector": sector})
             .sort("routeOrder", 1)
             .to_list(length=50000)
         )
@@ -1343,9 +1376,15 @@ async def list_tours(
     if not zones_or:
         return []
 
-    cycle_id = await resolve_cycle_id(db, date_value=date)
+    if date:
+        cycle_id: str | None = resolve_cycle_id_for_read(date_value=date)
+    else:
+        open_cycle_doc = await db.billing_cycles.find_one({"status": "OPEN"}, {"cycleId": 1})
+        cycle_id = str(open_cycle_doc["cycleId"]) if open_cycle_doc else None
 
-    query: dict = {"$or": zones_or, "cycleId": cycle_id}
+    query: dict = {"$or": zones_or}
+    if cycle_id:
+        query["cycleId"] = cycle_id
     if date:
         query["date"] = date
 

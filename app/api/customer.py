@@ -11,6 +11,7 @@ import httpx
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.api.models import (
+    ActiveCycleResponse,
     BillingLineItem,
     CustomerBillingResponse,
     CustomerLoyaltySummary,
@@ -22,7 +23,7 @@ from app.api.models import (
     SelfReadingAvailabilityResponse,
     TariffPublic,
 )
-from app.core.cycles import resolve_cycle_id
+from app.core.cycles import require_open_cycle
 from app.core.deps import get_current_user_payload, get_database, require_roles
 from app.core.settings import settings
 
@@ -384,11 +385,16 @@ async def _apply_self_submission_to_tour(
     db: AsyncIOMotorDatabase,
     cycle_id: str,
     meter_number: str,
-    reading_date: str,
     submitted_at: datetime,
 ) -> tuple[str | None, str | None]:
+    """
+    Cherche une tournée du cycle ouvert contenant ce compteur et marque
+    selfSubmittedByCustomer=True sur le TourItem correspondant.
+    Retourne (tourId, agentId) ou (None, None) si aucune tournée trouvée.
+    Non-bloquant : l'auto-relevé est accepté même sans tournée.
+    """
     tour = await db.tours.find_one(
-        {"cycleId": cycle_id, "date": str(reading_date), "items.meterNumber": str(meter_number)},
+        {"cycleId": cycle_id, "items.meterNumber": str(meter_number)},
         {"_id": 1, "agentId": 1},
     )
     if not tour:
@@ -472,6 +478,38 @@ async def _upsert_invoice_from_reading(
     )
 
 
+@router.get(
+    "/cycle/active",
+    response_model=ActiveCycleResponse,
+    dependencies=[Depends(require_roles("customer"))],
+)
+async def get_active_cycle_for_customer(
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    """
+    Retourne le cycle actuellement ouvert.
+    Utilisé par le client pour savoir si un cycle est en cours et s'il peut
+    soumettre un auto-relevé.
+    Retourne 404 si aucun cycle n'est ouvert.
+    """
+    cycle = await db.billing_cycles.find_one(
+        {"status": "OPEN"},
+        {"_id": 0, "cycleId": 1, "status": 1, "openedAt": 1, "closedAt": 1, "updatedAt": 1},
+    )
+    if not cycle:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Aucun cycle n'est actuellement ouvert.",
+        )
+    return ActiveCycleResponse(
+        cycleId=str(cycle["cycleId"]),
+        status="OPEN",
+        openedAt=cycle.get("openedAt"),
+        closedAt=cycle.get("closedAt"),
+        updatedAt=cycle.get("updatedAt"),
+    )
+
+
 @router.post(
     "/readings/self",
     response_model=ReadingPublic,
@@ -506,7 +544,8 @@ async def create_self_reading(
     if not meter_number:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Aucun compteur rattaché à ce compte.")
 
-    cycle_id = await resolve_cycle_id(db, date_value=str(date))
+    open_cycle_doc = await require_open_cycle(db)
+    cycle_id = open_cycle_doc["cycleId"]
 
     existing = await db.readings.find_one({"cycleId": cycle_id, "meterNumber": str(meter_number)})
     if existing:
@@ -535,18 +574,14 @@ async def create_self_reading(
         tariff_code = _infer_tariff_code_from_consumption(int(consumption), tiers)
 
     now = datetime.now(timezone.utc)
+    # Mise à jour de la tournée si ce compteur est planifié dans le cycle.
+    # Non-bloquant : le client peut soumettre même si aucune tournée n'existe encore.
     tour_id, assigned_agent_id = await _apply_self_submission_to_tour(
         db,
         cycle_id=cycle_id,
         meter_number=str(meter_number),
-        reading_date=str(date),
         submitted_at=now,
     )
-    if not tour_id:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Aucune tournée active ne contient ce compteur pour cette date. Relevé client non autorisé.",
-        )
 
     photo_url: str | None = None
     if photo is not None:
@@ -702,7 +737,18 @@ async def get_self_reading_availability(
     meter_number = customer.get("meterNumber")
     old_index = customer.get("oldIndex") if isinstance(customer.get("oldIndex"), int) else None
     target_date = str(dateValue).strip() if isinstance(dateValue, str) and str(dateValue).strip() else date.today().isoformat()
-    cycle_id = await resolve_cycle_id(db, date_value=target_date)
+
+    open_cycle_doc = await db.billing_cycles.find_one({"status": "OPEN"}, {"cycleId": 1})
+    if not open_cycle_doc:
+        return SelfReadingAvailabilityResponse(
+            date=target_date,
+            meterNumber=str(meter_number) if meter_number else None,
+            oldIndex=old_index,
+            canSubmit=False,
+            reason="Aucun cycle n'est actuellement ouvert.",
+        )
+    cycle_id = str(open_cycle_doc["cycleId"])
+
     if not meter_number:
         return SelfReadingAvailabilityResponse(
             date=target_date,
@@ -729,19 +775,6 @@ async def get_self_reading_availability(
             oldIndex=old_index,
             canSubmit=False,
             reason=reason,
-        )
-
-    has_tour = await db.tours.find_one(
-        {"cycleId": cycle_id, "date": target_date, "items.meterNumber": str(meter_number)},
-        {"_id": 1},
-    )
-    if not has_tour:
-        return SelfReadingAvailabilityResponse(
-            date=target_date,
-            meterNumber=str(meter_number),
-            oldIndex=old_index,
-            canSubmit=False,
-            reason="Tournée non générée pour ce compteur à cette date.",
         )
 
     return SelfReadingAvailabilityResponse(
