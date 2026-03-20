@@ -153,6 +153,7 @@ class ActiveCycleResponse(BaseModel):
 class AdminStatsResponse(BaseModel):
     internalUsers: int
     preRegisteredCustomers: int
+    importedMeters: int = 0
 
 
 class UserInDB(BaseModel):

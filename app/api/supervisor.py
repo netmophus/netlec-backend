@@ -139,6 +139,225 @@ async def get_active_cycle(db: AsyncIOMotorDatabase = Depends(get_database)):
     )
 
 
+@router.get(
+    "/stats",
+    dependencies=[Depends(require_roles("supervisor"))],
+)
+async def get_supervisor_stats(
+    token_payload: dict = Depends(get_current_user_payload),
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    """Comprehensive stats for the supervisor's zones: per-agent, per-zone, tour tracking."""
+    supervisor, zones_or = await _get_supervisor_context(token_payload, db)
+    if not zones_or:
+        return {
+            "totalReadings": 0, "totalAmount": 0, "totalInvoices": 0,
+            "totalTours": 0, "totalMeters": 0, "pendingCorrections": 0,
+            "agentStats": [], "zoneStats": [], "tourTracking": [],
+        }
+
+    assigned_zones = supervisor.get("assignedZones") or []
+    open_cycle = await db.billing_cycles.find_one({"status": "OPEN"})
+    cycle_id = open_cycle["cycleId"] if open_cycle else None
+
+    # ── Agents of this supervisor ──
+    agents_cursor = db.users.find({"role": "agent", "$or": zones_or}, {"_id": 1, "name": 1, "phone": 1, "center": 1, "zone": 1, "sector": 1, "isActive": 1})
+    agents_list = await agents_cursor.to_list(length=200)
+    agent_map = {str(a["_id"]): a for a in agents_list}
+
+    # ── Tours in supervisor zones ──
+    tours_q: dict = {"$or": zones_or}
+    if cycle_id:
+        tours_q["cycleId"] = cycle_id
+
+    tours_list = await db.tours.find(tours_q).sort("createdAt", -1).to_list(length=500)
+
+    # Collect all tour IDs (as strings) — readings reference tourId as string
+    tour_id_strings = [str(t["_id"]) for t in tours_list]
+
+    # ── Readings query via tourId (readings don't store center/zone/sector) ──
+    readings_q: dict = {"tourId": {"$in": tour_id_strings}} if tour_id_strings else {"_id": None}
+    if cycle_id:
+        readings_q["cycleId"] = cycle_id
+
+    # ── Aggregate readings per agent ──
+    agent_readings_pipeline = [
+        {"$match": readings_q},
+        {"$group": {
+            "_id": "$agentId",
+            "count": {"$sum": 1},
+            "totalAmount": {"$sum": {"$ifNull": ["$amount", 0]}},
+            "totalConsumption": {"$sum": {"$ifNull": ["$consumption", 0]}},
+        }},
+    ]
+    agent_readings_agg = await db.readings.aggregate(agent_readings_pipeline).to_list(length=500)
+    agent_readings_map = {str(r["_id"]): r for r in agent_readings_agg}
+
+    # ── Aggregate invoices (invoices DO store center/zone/sector) ──
+    invoices_q: dict = {"$or": zones_or}
+    if cycle_id:
+        invoices_q["cycleId"] = cycle_id
+
+    invoices_pipeline = [
+        {"$match": invoices_q},
+        {"$group": {
+            "_id": None,
+            "count": {"$sum": 1},
+            "totalAmount": {"$sum": {"$ifNull": ["$totalAmount", 0]}},
+        }},
+    ]
+    inv_agg = await db.invoices.aggregate(invoices_pipeline).to_list(length=1)
+    total_invoices = inv_agg[0]["count"] if inv_agg else 0
+    total_invoices_amount = inv_agg[0]["totalAmount"] if inv_agg else 0
+
+    # ── Tours aggregation per agent ──
+    tours_pipeline = [
+        {"$match": tours_q},
+        {"$group": {
+            "_id": "$agentId",
+            "tourCount": {"$sum": 1},
+            "totalItems": {"$sum": {"$size": {"$ifNull": ["$items", []]}}},
+        }},
+    ]
+    tours_agg = await db.tours.aggregate(tours_pipeline).to_list(length=500)
+    agent_tours_map = {str(t["_id"]): t for t in tours_agg}
+
+    # ── Tour tracking: individual tours with progress ──
+    tour_tracking = []
+    for t in tours_list:
+        tour_id_str = str(t["_id"])
+        items = t.get("items") or []
+        meter_numbers = [it.get("meterNumber") for it in items if it.get("meterNumber")]
+        done_count = 0
+        if meter_numbers and cycle_id:
+            done_count = await db.readings.count_documents({
+                "cycleId": cycle_id,
+                "tourId": tour_id_str,
+                "meterNumber": {"$in": meter_numbers},
+            })
+        agent_info = agent_map.get(str(t.get("agentId")))
+        tour_tracking.append({
+            "tourId": tour_id_str,
+            "date": t.get("date"),
+            "center": t.get("center"),
+            "zone": t.get("zone"),
+            "sector": t.get("sector"),
+            "agentId": str(t.get("agentId")),
+            "agentName": agent_info.get("name") if agent_info else None,
+            "totalItems": len(items),
+            "doneItems": done_count,
+            "progress": round(done_count / len(items) * 100) if items else 0,
+        })
+
+    # ── Build a map: tourId → zone info (from tours) for zone-level reading counts ──
+    tour_zone_map: dict[str, dict] = {}
+    for t in tours_list:
+        tour_zone_map[str(t["_id"])] = {
+            "center": t.get("center", ""),
+            "zone": t.get("zone", ""),
+            "sector": t.get("sector", ""),
+        }
+
+    # ── Aggregate readings per tourId for zone breakdown ──
+    readings_per_tour_pipeline = [
+        {"$match": readings_q},
+        {"$group": {
+            "_id": "$tourId",
+            "count": {"$sum": 1},
+        }},
+    ]
+    readings_per_tour = await db.readings.aggregate(readings_per_tour_pipeline).to_list(length=1000)
+    # Bucket by zone key
+    zone_readings_map: dict[str, int] = {}
+    for rpt in readings_per_tour:
+        tz = tour_zone_map.get(str(rpt["_id"]))
+        if tz:
+            key = f"{tz['center']}|{tz['zone']}|{tz['sector']}"
+            zone_readings_map[key] = zone_readings_map.get(key, 0) + rpt["count"]
+
+    # ── Aggregate by zone ──
+    zone_stats = []
+    for z in assigned_zones:
+        center = z.get("center", "")
+        zone = z.get("zone", "")
+        sector = z.get("sector", "")
+        if not center or not zone:
+            continue
+
+        zone_filter = {"center": center, "zone": zone}
+        if sector:
+            zone_filter["sector"] = sector
+
+        m_count = await db.meters.count_documents(zone_filter)
+
+        zone_key = f"{center}|{zone}|{sector}"
+        r_count = zone_readings_map.get(zone_key, 0)
+
+        inv_q = dict(zone_filter)
+        if cycle_id:
+            inv_q["cycleId"] = cycle_id
+        inv_zone_pipeline = [
+            {"$match": inv_q},
+            {"$group": {"_id": None, "count": {"$sum": 1}, "totalAmount": {"$sum": {"$ifNull": ["$totalAmount", 0]}}}},
+        ]
+        inv_zone_agg = await db.invoices.aggregate(inv_zone_pipeline).to_list(length=1)
+
+        zone_stats.append({
+            "center": center,
+            "zone": zone,
+            "sector": sector,
+            "meters": m_count,
+            "readings": r_count,
+            "invoices": inv_zone_agg[0]["count"] if inv_zone_agg else 0,
+            "invoicesAmount": inv_zone_agg[0]["totalAmount"] if inv_zone_agg else 0,
+        })
+
+    # ── Build agent stats ──
+    agent_stats = []
+    for a in agents_list:
+        aid = str(a["_id"])
+        r = agent_readings_map.get(aid, {})
+        t = agent_tours_map.get(aid, {})
+        agent_stats.append({
+            "agentId": aid,
+            "name": a.get("name"),
+            "phone": a.get("phone"),
+            "center": a.get("center"),
+            "zone": a.get("zone"),
+            "sector": a.get("sector"),
+            "isActive": a.get("isActive", False),
+            "readings": r.get("count", 0),
+            "totalAmount": r.get("totalAmount", 0),
+            "totalConsumption": r.get("totalConsumption", 0),
+            "tours": t.get("tourCount", 0),
+            "metersAssigned": t.get("totalItems", 0),
+        })
+
+    # ── Totals ──
+    total_readings = sum(r.get("count", 0) for r in agent_readings_agg)
+    total_amount = sum(r.get("totalAmount", 0) for r in agent_readings_agg)
+    total_tours = len(tours_list)
+    total_meters = await db.meters.count_documents({"$or": zones_or})
+
+    pending_q = dict(readings_q)
+    pending_q["correctionStatus"] = "PENDING_SUPERVISOR"
+    pending_corrections = await db.readings.count_documents(pending_q)
+
+    return {
+        "cycleId": cycle_id,
+        "totalReadings": total_readings,
+        "totalAmount": total_amount,
+        "totalInvoices": total_invoices,
+        "totalInvoicesAmount": total_invoices_amount,
+        "totalTours": total_tours,
+        "totalMeters": total_meters,
+        "pendingCorrections": pending_corrections,
+        "agentStats": agent_stats,
+        "zoneStats": zone_stats,
+        "tourTracking": tour_tracking,
+    }
+
+
 @router.patch(
     "/readings/{reading_id}/correction-review",
     response_model=ReadingPublic,
@@ -418,7 +637,6 @@ async def list_customers(
 
 @router.get(
     "/readings",
-    response_model=list[ReadingWithLocationPublic],
     dependencies=[Depends(require_roles("supervisor"))],
 )
 async def list_readings(
@@ -428,7 +646,8 @@ async def list_readings(
     agentId: str | None = Query(default=None),
     meterNumber: str | None = Query(default=None),
     correctionStatus: str | None = Query(default=None),
-    limit: int = Query(default=200, ge=1, le=1000),
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=500),
 ):
     supervisor_id = token_payload.get("sub")
     if not supervisor_id:
@@ -482,7 +701,8 @@ async def list_readings(
     if correctionStatus and correctionStatus.strip():
         readings_query["correctionStatus"] = correctionStatus.strip().upper()
 
-    cursor = db.readings.find(readings_query).sort([("date", -1), ("createdAt", -1)]).limit(limit)
+    total = await db.readings.count_documents(readings_query)
+    cursor = db.readings.find(readings_query).sort([("date", -1), ("createdAt", -1)]).skip(skip).limit(limit)
     docs = await cursor.to_list(length=limit)
 
     meter_numbers: set[str] = set()
@@ -581,7 +801,7 @@ async def list_readings(
 
         out.append(ReadingWithLocationPublic(**d))
 
-    return out
+    return {"items": out, "total": total, "skip": skip, "limit": limit}
 
 
 @router.get(

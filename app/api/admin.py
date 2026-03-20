@@ -557,19 +557,15 @@ async def list_cycles(
     dependencies=[Depends(require_roles("admin"))],
 )
 async def create_cycle(
-    cycleId: str | None = Query(default=None),
+    cycleId: str = Query(...),
     db: AsyncIOMotorDatabase = Depends(get_database),
 ):
     """
     Crée un cycle en statut DRAFT sans l'ouvrir.
-    Si cycleId n'est pas fourni, suggère le mois courant.
+    Le cycleId doit être fourni explicitement (format YYYY-MM).
     Utiliser POST /cycles/open pour l'ouvrir ensuite.
     """
-    target_cycle_id = (
-        _normalize_cycle_id_or_400(cycleId)
-        if isinstance(cycleId, str) and cycleId.strip()
-        else suggest_cycle_id()
-    )
+    target_cycle_id = _normalize_cycle_id_or_400(cycleId)
     existing = await db.billing_cycles.find_one({"cycleId": target_cycle_id})
     if existing:
         raise HTTPException(
@@ -608,17 +604,20 @@ async def open_cycle(
     target_cycle_id = _normalize_cycle_id_or_400(cycleId)
     now = datetime.now(timezone.utc)
 
+    existing = await db.billing_cycles.find_one({"cycleId": target_cycle_id})
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Le cycle {target_cycle_id} n'existe pas. Créez-le d'abord via POST /cycles.",
+        )
+
     await db.billing_cycles.update_many(
         {"status": "OPEN", "cycleId": {"$ne": target_cycle_id}},
         {"$set": {"status": "CLOSED", "closedAt": now, "updatedAt": now}},
     )
     await db.billing_cycles.update_one(
         {"cycleId": target_cycle_id},
-        {
-            "$set": {"status": "OPEN", "openedAt": now, "closedAt": None, "updatedAt": now},
-            "$setOnInsert": {"cycleId": target_cycle_id, "createdAt": now},
-        },
-        upsert=True,
+        {"$set": {"status": "OPEN", "openedAt": now, "closedAt": None, "updatedAt": now}},
     )
 
     return ActiveCycleResponse(
@@ -1749,9 +1748,11 @@ async def get_admin_stats(
 ):
     internal_users = await db.users.count_documents({"role": {"$in": ["admin", "supervisor", "agent"]}})
     pre_registered_customers = await db.users.count_documents({"role": "customer", "isActive": False})
+    imported_meters = await db.meters.count_documents({})
     return AdminStatsResponse(
         internalUsers=int(internal_users),
         preRegisteredCustomers=int(pre_registered_customers),
+        importedMeters=int(imported_meters),
     )
 
 
