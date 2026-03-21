@@ -3,7 +3,7 @@ import calendar
 import re
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 import httpx
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -17,6 +17,7 @@ from app.api.models import (
     TourPublic,
     UpdateReadingRequest,
 )
+from app.api.customer import _save_self_reading_photo
 from app.core.cycles import assert_cycle_is_open, require_open_cycle, resolve_cycle_id_for_read
 from app.core.deps import get_current_user_payload, get_database, require_roles
 from app.core.settings import settings
@@ -561,7 +562,16 @@ async def list_agent_tours(
     dependencies=[Depends(require_roles("agent"))],
 )
 async def create_reading(
-    payload: CreateReadingRequest,
+    tourId: str = Form(...),
+    date: str = Form(...),
+    meterNumber: str = Form(...),
+    newIndex: int = Form(...),
+    gpsLat: float | None = Form(default=None),
+    gpsLng: float | None = Form(default=None),
+    gpsAccuracy: float | None = Form(default=None),
+    gpsMissing: bool = Form(default=True),
+    gpsMissingReason: str | None = Form(default=None),
+    photo: UploadFile | None = File(default=None),
     token_payload: dict = Depends(get_current_user_payload),
     db: AsyncIOMotorDatabase = Depends(get_database),
 ):
@@ -581,28 +591,28 @@ async def create_reading(
     open_cycle_doc = await require_open_cycle(db)
     cycle_id = open_cycle_doc["cycleId"]
 
-    tour = await db.tours.find_one({"_id": ObjectId(payload.tourId), "cycleId": cycle_id})
+    tour = await db.tours.find_one({"_id": ObjectId(tourId), "cycleId": cycle_id})
     if not tour:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournée introuvable.")
     if str(tour.get("agentId")) != str(agent.get("_id")):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tournée non autorisée.")
-    if tour.get("date") != payload.date:
+    if tour.get("date") != date:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Date incohérente avec la tournée.")
 
-    in_tour = any((it.get("meterNumber") == payload.meterNumber) for it in (tour.get("items") or []))
+    in_tour = any((it.get("meterNumber") == meterNumber) for it in (tour.get("items") or []))
     if not in_tour:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Compteur non présent dans la tournée.")
 
-    customer = await db.users.find_one({"role": "customer", "meterNumber": payload.meterNumber})
+    customer = await db.users.find_one({"role": "customer", "meterNumber": meterNumber})
     if not customer:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client introuvable pour ce compteur.")
 
     old_index = customer.get("oldIndex")
     consumption: int | None = None
     if isinstance(old_index, int):
-        if payload.newIndex < old_index:
+        if newIndex < old_index:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Nouvel index inférieur à l'ancien index.")
-        consumption = payload.newIndex - old_index
+        consumption = newIndex - old_index
 
     tariff_code: str | None = None
     raw_customer_tariff = customer.get("tariffCode")
@@ -617,23 +627,34 @@ async def create_reading(
         if not tariff_code:
             tariff_code = _infer_tariff_code_from_consumption(int(consumption), tiers)
 
+    # ── Photo upload ──
+    photo_url: str | None = None
+    if photo is not None:
+        photo_url = await _save_self_reading_photo(photo, meter_number=str(meterNumber), reading_date=str(date))
+
+    gps_doc: dict | None = None
+    if gpsLat is not None and gpsLng is not None:
+        gps_doc = {"lat": gpsLat, "lng": gpsLng}
+        if gpsAccuracy is not None:
+            gps_doc["accuracy"] = gpsAccuracy
+
     now = datetime.now(timezone.utc)
     doc = {
         "cycleId": cycle_id,
-        "date": payload.date,
-        "tourId": payload.tourId,
+        "date": date,
+        "tourId": tourId,
         "agentId": str(agent.get("_id")),
-        "meterNumber": payload.meterNumber,
+        "meterNumber": meterNumber,
         "oldIndex": old_index,
-        "newIndex": payload.newIndex,
+        "newIndex": newIndex,
         "consumption": consumption,
         "tariffCode": tariff_code,
-        "gps": payload.gps,
-        "gpsMissing": payload.gpsMissing,
-        "gpsMissingReason": payload.gpsMissingReason,
+        "gps": gps_doc,
+        "gpsMissing": gps_doc is None,
+        "gpsMissingReason": gpsMissingReason.strip() if isinstance(gpsMissingReason, str) and gpsMissingReason.strip() else None,
         "source": "AGENT",
         "selfReadingStatus": None,
-        "photoUrl": None,
+        "photoUrl": photo_url,
         "loyaltyPointsAwarded": 0,
         "correctionStatus": "NONE",
         "correctionAudit": [],
@@ -641,7 +662,7 @@ async def create_reading(
         "updatedAt": now,
     }
 
-    existing = await db.readings.find_one({"cycleId": cycle_id, "meterNumber": payload.meterNumber})
+    existing = await db.readings.find_one({"cycleId": cycle_id, "meterNumber": meterNumber})
     if existing:
         existing["_id"] = str(existing["_id"])
         return ReadingPublic(**existing)
@@ -651,10 +672,10 @@ async def create_reading(
     if not created:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Erreur création relevé.")
 
-    await db.users.update_one({"_id": customer["_id"]}, {"$set": {"oldIndex": payload.newIndex, "updatedAt": now}})
+    await db.users.update_one({"_id": customer["_id"]}, {"$set": {"oldIndex": newIndex, "updatedAt": now}})
 
     grace_days = 10
-    due_d = _end_of_month_due_date(payload.date, grace_days)
+    due_d = _end_of_month_due_date(date, grace_days)
     due_date_str = due_d.isoformat() if due_d else None
     invoice_id = f"INV-{str(res.inserted_id)}"
 
@@ -686,9 +707,9 @@ async def create_reading(
                 "cycleId": cycle_id,
                 "readingId": str(res.inserted_id),
                 "customerId": str(customer.get("_id")),
-                "meterNumber": str(payload.meterNumber),
-                "period": str(payload.date)[:7] if len(str(payload.date)) >= 7 else str(payload.date),
-                "date": str(payload.date),
+                "meterNumber": str(meterNumber),
+                "period": str(date)[:7] if len(str(date)) >= 7 else str(date),
+                "date": str(date),
                 "dueDate": due_date_str,
                 "tariffCode": str(tc) if tc is not None else None,
                 "consumption": cons if isinstance(cons, int) else None,
